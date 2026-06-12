@@ -476,15 +476,23 @@ function _initModelPickerDropdown() {
 
     if (!hasAnyModel) return; // collapsed empty list — nothing to render
 
-    // Unique lookup so Recent/Favorites (stored as bare model IDs) can be
-    // resolved back to full model objects; drops anything no longer offered.
-    const byId = new Map();
+    // Recent/Favorites may be stored endpoint-qualified (_pickerModelKey) or, from
+    // older builds, as a bare model ID. Resolve a qualified entry to that exact
+    // endpoint's copy and a bare ID to *all* its endpoint copies, so a model served
+    // by several live endpoints doesn't silently lose the copies the user didn't
+    // happen to favorite. Drops anything no longer offered.
     const byKey = new Map();
+    const byMid = new Map();
     all.forEach(m => {
       const key = _pickerModelKey(m);
       if (key && !byKey.has(key)) byKey.set(key, m);
-      if (!byId.has(m.mid)) byId.set(m.mid, m);
+      if (!byMid.has(m.mid)) byMid.set(m.mid, []);
+      byMid.get(m.mid).push(m);
     });
+    const _resolveStored = (id) => {
+      const exact = byKey.get(id);
+      return exact ? [exact] : (byMid.get(id) || []);
+    };
 
     const favs = _loadFavorites();
 
@@ -587,15 +595,15 @@ function _initModelPickerDropdown() {
 
     // ── Browse mode: Favorites (manual) + Recent (auto), with dedupe. ──
     // Rules:
-    //   1. Never list the same model twice in the dropdown. Favorites
-    //      win over Recent (if you favorited it, that's where it
-    //      belongs — Recent shouldn't show it again as duplicate).
+    //   1. Never list the same model *from the same endpoint* twice. A model
+    //      served by several endpoints lists once per endpoint (provider
+    //      choice). Favorites win over Recent for a given (model, endpoint).
     //   2. Small catalogs (≤ BROWSE_ALL_LIMIT total) skip the Recent
     //      section entirely — when there's only ~10 models, the whole
     //      list fits below as "All models" and a separate Recent
     //      section just duplicates rows.
     const shown = new Set();
-    const favModels = favs.map(id => byKey.get(id) || byId.get(id)).filter(Boolean);
+    const favModels = favs.flatMap(_resolveStored);
     if (favModels.length) {
       _addSection('Favorites');
       favModels.forEach(m => { shown.add(_pickerModelKey(m)); _addRow(m); });
@@ -605,8 +613,7 @@ function _initModelPickerDropdown() {
     // aren't already in Favorites (dedupe).
     if (all.length > BROWSE_ALL_LIMIT) {
       const recentModels = _loadRecent()
-        .map(id => byKey.get(id) || byId.get(id))
-        .filter(Boolean)
+        .flatMap(_resolveStored)
         .filter(m => !shown.has(_pickerModelKey(m)))
         .slice(0, RECENT_MAX);
       if (recentModels.length) {
