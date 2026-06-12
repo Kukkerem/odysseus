@@ -281,22 +281,28 @@ function _initModelPickerDropdown() {
       return !!item.offline || !!(probe && probe.alive === false);
     };
     const result = [];
-    const seen = new Set();
-    // Honor the dedupe's intent (the `seen` check below keeps the first
-    // entry for each model id): process healthy endpoints before dead ones,
-    // so when the same model is exposed by several endpoints the *working*
-    // one is kept rather than a stale/offline duplicate that merely happened
-    // to be listed first. Array.prototype.sort is stable, so endpoints keep
-    // their original relative order within each health tier.
+    // Online-first dedupe. A model is often served by several endpoints. The
+    // goal is to drop a copy on a DEAD endpoint when some healthy endpoint also
+    // serves that model (so a briefly-down server can't mask a working
+    // duplicate) — but NOT to collapse the healthy copies themselves: two live
+    // endpoints serving the same model are a real provider choice the user
+    // should keep (e.g. `deepseek-v4-flash` on both Ollama Cloud and OpenCode
+    // Go). So: keep every live endpoint's copy; surface a dead endpoint's copy
+    // only when no live endpoint serves that id, collapsing dead-only copies to
+    // one so an id that exists solely on down servers still appears once
+    // (flagged `stale`) instead of vanishing.
+    const liveMids = new Set(); // model ids served by >=1 healthy endpoint
+    const deadSeen = new Set(); // dead-only ids already surfaced (collapse dupes)
+    const apiSeen = new Set();  // endpoint-qualified ids already surfaced (cloud/API)
+    // Stable sort puts every healthy endpoint before any dead one, so `liveMids`
+    // is fully populated before a dead endpoint is ever considered below.
     const ordered = [...items].sort((a, b) => Number(_endpointDead(a)) - Number(_endpointDead(b)));
     ordered.forEach(item => {
-      // Previously: offline endpoints were skipped entirely, so a server
-      // that briefly went down disappeared from the picker — confusing
-      // when the user can still see it (offline-tagged) in Settings.
-      // Now: include offline-endpoint models too but flag them
-      // `stale: true` so the row renderer dims them + shows the offline
-      // pill. The user can still click and try anyway (matches the
-      // existing "local server appears offline" path on line 301).
+      const dead = _endpointDead(item);
+      // Offline endpoints aren't skipped (a server that briefly went down would
+      // vanish from the picker even though Settings still lists it). Their
+      // models are flagged `stale: true` so the row renderer dims them; the
+      // user can still click to try anyway.
       const epOffline = !!item.offline;
       const allModels = (item.models || []).concat(item.models_extra || []);
       const allDisplay = (item.models_display || []).concat(item.models_extra_display || []);
@@ -305,16 +311,29 @@ function _initModelPickerDropdown() {
       const isLocalDead = !!(probeResult && probeResult.alive === false);
       const isApiEndpoint = item.category && item.category !== 'local';
       allModels.forEach((mid, i) => {
-        // Local/self-hosted servers often expose the same model through several
-        // stale endpoints, so keep deduping those by model id. Cloud/API
-        // endpoints are user-selected provider routes; the same model id can be
-        // intentionally enabled on OpenRouter and OpenAI, so key those by
-        // endpoint too or the chat picker silently drops one.
-        const seenKey = isApiEndpoint
-          ? `${item.endpoint_id || item.url || item.endpoint_name || 'api'}::${mid}`
-          : mid;
-        if (seen.has(seenKey)) return;
-        seen.add(seenKey);
+        // Two different duplicate problems, two different rules:
+        // - Cloud/API endpoints are user-selected provider routes: the same model
+        //   id can be intentionally enabled on OpenRouter and OpenAI, so key those
+        //   by endpoint or the chat picker silently drops one.
+        // - Local/self-hosted copies are deduped by endpoint health instead (see
+        //   the online-first note above): keep every live copy, and surface a dead
+        //   endpoint's copy only when no live endpoint serves that id.
+        // `seenKey` mirrors _pickerModelKey()'s shape so Favorites/Recent, which
+        // resolve through it, can address a specific endpoint's copy.
+        const seenKey = `${item.endpoint_id || item.url || item.endpoint_name || (isApiEndpoint ? 'api' : 'local')}::${mid}`;
+        if (isApiEndpoint) {
+          if (apiSeen.has(seenKey)) return;
+          apiSeen.add(seenKey);
+        } else if (dead) {
+          // Hidden behind a healthy copy, or already shown from another dead
+          // endpoint — skip so dead servers can't mask or duplicate.
+          if (liveMids.has(mid) || deadSeen.has(mid)) return;
+          deadSeen.add(mid);
+        } else {
+          // Healthy copy: always keep it (provider choice preserved even when
+          // several live endpoints expose the same id).
+          liveMids.add(mid);
+        }
         result.push({
           key: seenKey,
           mid,
