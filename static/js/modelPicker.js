@@ -176,9 +176,22 @@ function _initModelPickerDropdown() {
 
   function _getAllModels() {
     const items = (window.modelsModule && window.modelsModule.getCachedItems) ? window.modelsModule.getCachedItems() : [];
+    // Endpoint health: "dead" = the server tagged the endpoint offline OR
+    // its live local probe failed. Used to order the dedupe below.
+    const _endpointDead = (item) => {
+      const probe = item.endpoint_id ? _localProbe[item.endpoint_id] : null;
+      return !!item.offline || !!(probe && probe.alive === false);
+    };
     const result = [];
     const seen = new Set();
-    items.forEach(item => {
+    // Honor the dedupe's intent (the `seen` check below keeps the first
+    // entry for each model id): process healthy endpoints before dead ones,
+    // so when the same model is exposed by several endpoints the *working*
+    // one is kept rather than a stale/offline duplicate that merely happened
+    // to be listed first. Array.prototype.sort is stable, so endpoints keep
+    // their original relative order within each health tier.
+    const ordered = [...items].sort((a, b) => Number(_endpointDead(a)) - Number(_endpointDead(b)));
+    ordered.forEach(item => {
       // Previously: offline endpoints were skipped entirely, so a server
       // that briefly went down disappeared from the picker — confusing
       // when the user can still see it (offline-tagged) in Settings.
