@@ -308,10 +308,18 @@ function _initModelPickerDropdown() {
 
     if (!hasAnyModel) return; // collapsed empty list — nothing to render
 
-    // Unique lookup so Recent/Favorites (stored as bare model IDs) can be
-    // resolved back to full model objects; drops anything no longer offered.
-    const byId = new Map();
-    all.forEach(m => { if (!byId.has(m.mid)) byId.set(m.mid, m); });
+    // Recent/Favorites are stored as bare model IDs, but a model can be served
+    // by several endpoints (each a distinct provider choice). Resolve each ID
+    // to *all* its endpoint copies so none get silently dropped below; drops
+    // anything no longer offered.
+    const byMid = new Map();
+    all.forEach(m => {
+      if (!byMid.has(m.mid)) byMid.set(m.mid, []);
+      byMid.get(m.mid).push(m);
+    });
+    // Browse-mode dedupe key: a model counts as "already shown" only for the
+    // *same* endpoint, so `deepseek-v4-flash` on two live endpoints lists both.
+    const _epKey = (m) => `${m.mid}\u0000${m.endpointId || ''}`;
 
     const favs = _loadFavorites();
 
@@ -414,44 +422,43 @@ function _initModelPickerDropdown() {
 
     // ── Browse mode: Favorites (manual) + Recent (auto), with dedupe. ──
     // Rules:
-    //   1. Never list the same model twice in the dropdown. Favorites
-    //      win over Recent (if you favorited it, that's where it
-    //      belongs — Recent shouldn't show it again as duplicate).
+    //   1. Never list the same model *from the same endpoint* twice. A model
+    //      served by several endpoints lists once per endpoint (provider
+    //      choice). Favorites win over Recent for a given (model, endpoint).
     //   2. Small catalogs (≤ BROWSE_ALL_LIMIT total) skip the Recent
     //      section entirely — when there's only ~10 models, the whole
     //      list fits below as "All models" and a separate Recent
     //      section just duplicates rows.
     const shown = new Set();
-    const favModels = favs.map(id => byId.get(id)).filter(Boolean);
+    const favModels = favs.flatMap(id => byMid.get(id) || []);
     if (favModels.length) {
       _addSection('Favorites');
-      favModels.forEach(m => { shown.add(m.mid); _addRow(m); });
+      favModels.forEach(m => { shown.add(_epKey(m)); _addRow(m); });
     }
     // Recent: only render when the catalog is big enough that surfacing
     // a recency shortlist is actually useful, AND only models that
     // aren't already in Favorites (dedupe).
     if (all.length > BROWSE_ALL_LIMIT) {
       const recentModels = _loadRecent()
-        .map(id => byId.get(id))
-        .filter(Boolean)
-        .filter(m => !shown.has(m.mid))
+        .flatMap(id => byMid.get(id) || [])
+        .filter(m => !shown.has(_epKey(m)))
         .slice(0, RECENT_MAX);
       if (recentModels.length) {
         _addSection('Recent');
-        recentModels.forEach(m => { shown.add(m.mid); _addRow(m); });
+        recentModels.forEach(m => { shown.add(_epKey(m)); _addRow(m); });
       }
     }
 
     // Small catalogs: still list everything so users aren't forced to search.
     if (all.length <= BROWSE_ALL_LIMIT) {
-      const rest = all.filter(m => !shown.has(m.mid));
+      const rest = all.filter(m => !shown.has(_epKey(m)));
       if (rest.length) {
         if (shown.size) _addSection('All models');
         rest.forEach(_addRow);
       }
     } else {
       // Large catalog: show provider groups with collapsible sections.
-      const rest = all.filter(m => !shown.has(m.mid));
+      const rest = all.filter(m => !shown.has(_epKey(m)));
       const groups = new Map();
       rest.forEach(m => {
         const slug = _providerSlug(m.mid);
