@@ -177,11 +177,11 @@ def _discover_calendars(client):
 
 
 def _writeback_blocking(local_cal_id, ev, delete, url, username, password,
-                        owner="", account_id="") -> dict:
+                        owner="", account_id="", access_token=None) -> dict:
     from src.caldav_sync import _build_dav_client
     # Redirects disabled here too: the write-back path opens its own DAVClient,
     # so it needs the same SSRF-via-redirect protection as the pull path.
-    client = _build_dav_client(url, username, password)
+    client = _build_dav_client(url, username, password, access_token)
     calendars = _discover_calendars(client)
     if not calendars:
         return {"ok": False, "error": "no remote calendars discovered"}
@@ -274,9 +274,20 @@ async def writeback_event(owner: str, calendar_source: str, calendar_id: str,
 
         url = (acc.get("url") or "").strip()
         user = (acc.get("username") or "").strip()
-        pw = decrypt(acc.get("password") or "")
-        if not (url and user and pw):
-            return {"skipped": "caldav account credentials incomplete"}
+        auth_mode = (acc.get("auth_mode") or "basic").lower()
+        access_token = None
+        pw = ""
+        if auth_mode == "oauth":
+            from src.caldav_sync import _resolve_google_caldav_token
+            access_token = _resolve_google_caldav_token(owner, acc)
+            if not access_token:
+                return {"ok": False, "error": "Google authorization expired — reconnect Google Calendar"}
+            if not (url and user):
+                return {"skipped": "caldav account credentials incomplete"}
+        else:
+            pw = decrypt(acc.get("password") or "")
+            if not (url and user and pw):
+                return {"skipped": "caldav account credentials incomplete"}
         from src.caldav_sync import validate_caldav_url
         try:
             url = validate_caldav_url(url)
@@ -285,7 +296,8 @@ async def writeback_event(owner: str, calendar_source: str, calendar_id: str,
             return {"ok": False, "error": str(e)[:200]}
         acc_id = acc.get("id") or ""
         result = await asyncio.to_thread(
-            _writeback_blocking, calendar_id, ev, delete, url, user, pw, owner, acc_id
+            _writeback_blocking, calendar_id, ev, delete, url, user, pw, owner, acc_id,
+            access_token=access_token,
         )
         _persist_writeback_result(owner, calendar_id, (ev or {}).get("uid", ""), result, delete=delete)
         if not result.get("ok"):
