@@ -92,3 +92,21 @@ def test_camel_case_secret_keys_blanked():
 def test_non_object_settings_return_empty_mapping():
     assert scrub_settings(["not", "settings"]) == {}
     assert scrub_settings("not settings") == {}
+
+
+def test_scrub_blanks_caldav_oauth_tokens_keeps_label():
+    """CalDAV OAuth accounts live in caldav_accounts (a list of dicts). The
+    scrub must blank the token fields but keep the non-secret label/username
+    and the (non-secret) expiry timestamp."""
+    out = scrub_settings({"caldav_accounts": [{
+        "id": "a1", "label": "Work", "username": "me@x.com",
+        "oauth_access_token": "ya29.secret",
+        "oauth_refresh_token": "1//secret",
+        "oauth_token_expiry": "1750000000",
+    }]})
+    acc = out["caldav_accounts"][0]
+    assert acc["oauth_access_token"] == ""
+    assert acc["oauth_refresh_token"] == ""
+    assert acc["label"] == "Work"          # non-secret preserved
+    assert acc["username"] == "me@x.com"
+    assert acc["oauth_token_expiry"] == "1750000000"  # not secret-shaped
