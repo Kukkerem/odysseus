@@ -29,6 +29,7 @@ import logging
 import os
 import socket
 import uuid
+import time
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse, urlunparse
 
@@ -628,6 +629,66 @@ def _load_caldav_accounts(owner: str) -> list:
         return accounts
     return []
 
+# Refresh slightly before expiry so an in-flight sync doesn't race the cutoff.
+_TOKEN_EXPIRY_SKEW_SECONDS = 60
+
+
+def _refresh_google_caldav_token(owner: str, account_id: str) -> str | None:
+    """Exchange the account's stored refresh token for a new access token and
+    persist the encrypted token + expiry back into the owner's prefs entry."""
+    from routes.prefs_routes import _load_for_user, _save_for_user
+    from src.secret_storage import decrypt as _dec, encrypt as _enc
+    from src.google_oauth import exchange_refresh_token, google_client_credentials
+
+    client_id, client_secret = google_client_credentials()
+    if not (client_id and client_secret):
+        return None
+    prefs = _load_for_user(owner) or {}
+    accounts = list(prefs.get("caldav_accounts") or [])
+    idx = next((i for i, a in enumerate(accounts) if a.get("id") == account_id), None)
+    if idx is None:
+        return None
+    acc = accounts[idx]
+    try:
+        refresh_token = _dec(acc.get("oauth_refresh_token") or "")
+    except Exception:
+        refresh_token = ""
+    if not refresh_token:
+        return None
+    try:
+        data = exchange_refresh_token(client_id, client_secret, refresh_token)
+        access_token = data["access_token"]
+    except Exception:
+        logger.warning("Google CalDAV token refresh failed for account %s", account_id)
+        return None
+    acc["oauth_access_token"] = _enc(access_token)
+    acc["oauth_token_expiry"] = str(int(time.time()) + data.get("expires_in", 3600))
+    accounts[idx] = acc
+    prefs["caldav_accounts"] = accounts
+    try:
+        _save_for_user(owner, prefs)
+    except Exception:
+        logger.warning("Persisting refreshed CalDAV token failed for account %s", account_id)
+    return access_token
+
+
+def _resolve_google_caldav_token(owner: str, account: dict) -> str | None:
+    """Return a valid Google access token for an OAuth CalDAV account,
+    refreshing (and persisting) when the cached token is missing or expiring."""
+    from src.secret_storage import decrypt as _dec
+
+    try:
+        access_token = _dec(account.get("oauth_access_token") or "")
+    except Exception:
+        access_token = ""
+    expiry_raw = account.get("oauth_token_expiry") or ""
+    if access_token and expiry_raw:
+        try:
+            if int(expiry_raw) - _TOKEN_EXPIRY_SKEW_SECONDS > time.time():
+                return access_token
+        except (ValueError, TypeError):
+            pass
+    return _refresh_google_caldav_token(owner, account.get("id") or "")
 
 async def sync_caldav(owner: str) -> dict:
     """Pull CalDAV state into local DB for `owner` across all configured accounts.
