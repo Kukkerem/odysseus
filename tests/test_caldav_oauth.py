@@ -156,3 +156,80 @@ def test_writeback_oauth_resolves_token_and_passes_it(monkeypatch):
     assert out["ok"] is True
     assert seen["access_token"] == "ya29.live"
     assert seen["password"] == ""
+
+# --- Task 7: diagnostics ---
+import types
+
+
+def _install_fake_caldav_raising(monkeypatch, exc_factory):
+    """Install a fake `caldav` module whose calendar.date_search raises."""
+    import sys
+
+    class _FakeError(Exception):
+        pass
+
+    fake = types.ModuleType("caldav")
+    err_mod = types.ModuleType("caldav.lib.error")
+    lib_mod = types.ModuleType("caldav.lib")
+
+    class AuthorizationError(_FakeError):
+        pass
+
+    class NotFoundError(_FakeError):
+        pass
+
+    err_mod.AuthorizationError = AuthorizationError
+    err_mod.NotFoundError = NotFoundError
+
+    class _Cal:
+        def __init__(self, url):
+            self.url = url
+            self.name = "Primary"
+
+        def date_search(self, start, end, expand=False):
+            raise exc_factory(err_mod)
+
+    class _Principal:
+        def calendars(self):
+            return [_Cal("https://www.google.com/calendar/dav/me@x.com/events")]
+
+    class _Session:
+        def __init__(self):
+            self.headers = {}
+            self.max_redirects = None
+
+    class _Client:
+        def __init__(self, url=None, username=None, password=None):
+            self.url = url
+            self.session = _Session()
+            self.headers = {}
+            self.auth = None
+
+        def principal(self):
+            return _Principal()
+
+        def calendar(self, url=None):
+            return _Cal(url)
+
+    fake.DAVClient = _Client
+    fake.lib = lib_mod
+    lib_mod.error = err_mod
+    monkeypatch.setitem(sys.modules, "caldav", fake)
+    monkeypatch.setitem(sys.modules, "caldav.lib", lib_mod)
+    monkeypatch.setitem(sys.modules, "caldav.lib.error", err_mod)
+    return err_mod
+
+
+def test_google_basic_auth_primary_404_emits_oauth_hint(monkeypatch):
+    _install_fake_caldav_raising(monkeypatch, lambda err: err.NotFoundError("404"))
+    out = caldav_sync._sync_blocking(
+        "alice", "https://www.google.com/calendar/dav/me@x.com/user", "me@x.com", "app-pw")
+    assert any("OAuth" in e or "Connect Google Calendar" in e for e in out["errors"]), out["errors"]
+
+
+def test_non_google_404_keeps_generic_message(monkeypatch):
+    _install_fake_caldav_raising(monkeypatch, lambda err: err.NotFoundError("404"))
+    out = caldav_sync._sync_blocking(
+        "alice", "https://dav.fastmail.com/dav/calendars/user/me/", "me", "pw")
+    assert any("date_search failed" in e for e in out["errors"])
+    assert not any("Connect Google Calendar" in e for e in out["errors"])
