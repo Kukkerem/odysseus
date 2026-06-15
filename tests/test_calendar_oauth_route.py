@@ -89,3 +89,25 @@ async def test_callback_missing_code_returns_generic_error():
     resp = await callback(code=None, state=make_oauth_state("a", "alice"),
                           error=None, request=_FakeRequest())
     assert "calendar_oauth_error=missing_code" in _loc(resp)
+
+@pytest.mark.asyncio
+async def test_account_list_exposes_auth_mode_never_tokens(monkeypatch):
+    """The accounts list must expose auth_mode (so the UI shows OAuth status)
+    but never the token fields/values."""
+    from src.secret_storage import encrypt as _enc
+    monkeypatch.setattr("routes.calendar_routes._require_user", lambda req: "alice", raising=False)
+    acc = {
+        "id": "acc-o", "label": "Work", "auth_mode": "oauth", "oauth_provider": "google",
+        "url": "https://apidata.googleusercontent.com/caldav/v2/me@x.com/user",
+        "username": "me@x.com", "password": "",
+        "oauth_access_token": _enc("ya29.secret"),
+        "oauth_refresh_token": _enc("1//secret"),
+        "oauth_token_expiry": "1750000000",
+    }
+    monkeypatch.setattr("routes.prefs_routes._load_for_user",
+                        lambda o=None: {"caldav_accounts": [acc]})
+    list_accounts = _route("/api/calendar/config/accounts")
+    resp = await list_accounts(request=_FakeRequest())
+    a = resp["accounts"][0]
+    assert a["auth_mode"] == "oauth"
+    assert set(a.keys()) == {"id", "label", "url", "username", "has_password", "auth_mode"}
