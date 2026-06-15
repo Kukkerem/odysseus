@@ -321,6 +321,26 @@ and Microsoft 365 generally require OAuth instead, so normal Microsoft mailbox
 passwords will fail. See [docs/email-outlook.md](docs/email-outlook.md) for the
 current limitation and the planned integration direction.
 
+### Google Calendar (Workspace) via OAuth
+Google Workspace accounts often have app-password CalDAV disabled, so the
+primary calendar never syncs and reads return `404 No events found` (the v2
+CalDAV endpoint requires OAuth). To connect such an account, in the **same
+Google Cloud project** you use for Gmail OAuth:
+
+1. Enable the **Google Calendar API**.
+2. On the OAuth consent screen, add the `https://www.googleapis.com/auth/calendar`
+   scope (read-write calendar) alongside the existing email scope.
+3. Register the redirect URI `<base>/api/calendar/oauth/google/callback`
+   (e.g. `http://localhost:7000/api/calendar/oauth/google/callback`, or your
+   public origin behind a reverse proxy — see `GOOGLE_CALENDAR_OAUTH_REDIRECT_URI`
+   in `.env.example`).
+
+Then in **Settings → Integrations → Add CalDAV Calendar**, click **Connect
+Google Calendar**. The callback auto-fills the v2 endpoint and account email and
+stores the OAuth tokens (encrypted) — no URL or app password needed. Existing
+non-Google CalDAV servers (Nextcloud, Fastmail, Apple, Radicale) keep using
+basic auth unchanged.
+
 ## Security Notes
 Odysseus is a self-hosted workspace with powerful local tools: shell access, file uploads, model downloads, web research, email/calendar integrations, and API tokens. Treat it like an admin console.
 
