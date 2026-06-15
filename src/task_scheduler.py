@@ -670,7 +670,7 @@ class TaskScheduler:
         finally:
             db.close()
 
-    async def _execute_task(self, task_id: str, *, bypass_model_slot: bool = False, release_executing: bool = True):
+    async def _execute_task(self, task_id: str, *, bypass_model_slot: bool = False, release_executing: bool = True, manual: bool = False):
         # Create the run record with status="queued" BEFORE waiting on the
         # semaphore so the UI can show that a manually-triggered task is in
         # line behind another. Once we acquire the slot, flip to "running"
@@ -698,11 +698,11 @@ class TaskScheduler:
 
         try:
             if bypass_model_slot or not self._task_needs_model_slot(task_id):
-                await self._execute_task_locked(task_id, run_id, release_executing=release_executing)
+                await self._execute_task_locked(task_id, run_id, release_executing=release_executing, manual=manual)
                 return
 
             async with self._run_semaphore:
-                await self._execute_task_locked(task_id, run_id, release_executing=release_executing)
+                await self._execute_task_locked(task_id, run_id, release_executing=release_executing, manual=manual)
         except asyncio.CancelledError:
             # If cancellation happens while queued behind the semaphore,
             # _execute_task_locked never runs and cannot update the Activity row.
@@ -716,20 +716,25 @@ class TaskScheduler:
                 async with self._executing_lock:
                     self._executing.discard(task_id)
 
-    async def _execute_task_locked(self, task_id: str, run_id: str, *, release_executing: bool = True):
+    async def _execute_task_locked(self, task_id: str, run_id: str, *, release_executing: bool = True, manual: bool = False):
         from core.database import SessionLocal, ScheduledTask, TaskRun
 
         db = SessionLocal()
         try:
             task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
-            if not task or task.status != "active":
+            if not task or (task.status != "active" and not manual):
                 # Task was paused/deleted while queued — record that outcome
                 # so the run row doesn't sit as "queued" forever.
                 stale = db.query(TaskRun).filter(TaskRun.id == run_id).first()
                 if stale and stale.status == "queued":
+                    reason = f"Task no longer active (status={task.status if task else 'deleted'})"
                     stale.status = "skipped"
                     stale.finished_at = _utcnow()
-                    stale.error = f"Task no longer active (status={task.status if task else 'deleted'})"
+                    stale.error = reason
+                    # Overwrite the creation-time "Queued — waiting for a free
+                    # slot…" placeholder so the Activity row no longer looks
+                    # like it is still waiting on the model slot.
+                    stale.result = f"Skipped — {reason}"
                     db.commit()
                 return
 
@@ -2015,16 +2020,22 @@ class TaskScheduler:
         except Exception as e:
             logger.error(f"Task {task.id} MCP delivery failed: {e}")
 
-    async def run_task_now(self, task_id: str, *, force: bool = False):
-        """Manually trigger a task execution."""
+    async def run_task_now(self, task_id: str, *, force: bool = False, manual: bool = False):
+        """Manually trigger a task execution.
+
+        manual=True marks a user-initiated "Run now": it overrides a paused
+        task status for this single execution (see _execute_task_locked) so a
+        disabled task can be tested on demand. Automated callers (event bus,
+        webhook, chains) leave it False so pausing still disables them.
+        """
         if force:
-            asyncio.create_task(self._execute_task(task_id, bypass_model_slot=True, release_executing=False))
+            asyncio.create_task(self._execute_task(task_id, bypass_model_slot=True, release_executing=False, manual=manual))
             return True
         async with self._executing_lock:
             if task_id in self._executing:
                 return False
             self._executing.add(task_id)
-        asyncio.create_task(self._execute_task(task_id))
+        asyncio.create_task(self._execute_task(task_id, manual=manual))
         return True
 
     async def stop_task(self, task_id: str) -> bool:
