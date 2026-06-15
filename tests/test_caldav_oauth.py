@@ -130,3 +130,29 @@ def test_sync_caldav_oauth_unresolvable_token_surfaces_reconnect(monkeypatch):
                         mock.MagicMock(side_effect=AssertionError("must not sync")))
     out = asyncio.run(caldav_sync.sync_caldav("alice"))
     assert any("reconnect" in e.lower() for e in out["errors"])
+
+# --- Task 6: writeback threading ---
+from src import caldav_writeback
+
+
+def test_writeback_oauth_resolves_token_and_passes_it(monkeypatch):
+    acc = {"id": "acc-o", "label": "Work", "auth_mode": "oauth", "oauth_provider": "google",
+           "url": "https://apidata.googleusercontent.com/caldav/v2/me@x.com/user",
+           "username": "me@x.com"}
+    monkeypatch.setattr(caldav_writeback, "_load_caldav_accounts", lambda o: [acc], raising=False)
+    monkeypatch.setattr(caldav_sync, "_load_caldav_accounts", lambda o: [acc])
+    monkeypatch.setattr(caldav_sync, "_resolve_google_caldav_token", lambda o, a: "ya29.live")
+    seen = {}
+
+    def _fake_blocking(local_cal_id, ev, delete, url, username, password,
+                       owner="", account_id="", access_token=None):
+        seen.update(access_token=access_token, password=password)
+        return {"ok": True}
+
+    monkeypatch.setattr(caldav_writeback, "_writeback_blocking", _fake_blocking)
+    monkeypatch.setattr(caldav_writeback, "_persist_writeback_result", lambda *a, **k: None)
+    out = asyncio.run(caldav_writeback.writeback_event(
+        "alice", "caldav", "cal-1", {"uid": "u1", "summary": "x"}))
+    assert out["ok"] is True
+    assert seen["access_token"] == "ya29.live"
+    assert seen["password"] == ""
