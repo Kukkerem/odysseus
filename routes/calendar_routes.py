@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, date, timedelta
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query
 from pydantic import BaseModel
 from sqlalchemy import or_, and_
 from dateutil.rrule import rrulestr
@@ -987,6 +987,99 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
         owner = _require_user(request)
         from src.caldav_sync import sync_caldav_direction
         return await sync_caldav_direction(owner, direction)
+
+    def _calendar_redirect_uri(request: Request) -> str:
+        return (
+            _os.environ.get("GOOGLE_CALENDAR_OAUTH_REDIRECT_URI")
+            or f"http://{request.headers.get('host', 'localhost:7000')}/api/calendar/oauth/google/callback"
+        )
+
+    @router.get("/oauth/google/authorize")
+    async def calendar_google_oauth_authorize(request: Request):
+        import urllib.parse
+        from fastapi.responses import RedirectResponse
+        from routes.email_helpers import make_oauth_state
+        owner = _require_user(request)
+        client_id = _os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+        if not client_id:
+            raise HTTPException(400, "GOOGLE_OAUTH_CLIENT_ID not set — add it to .env")
+        # One-click connect mints the account id here; the callback creates the
+        # prefs entry under it. The id is bound into the signed state.
+        account_id = str(uuid.uuid4())
+        state = make_oauth_state(account_id, owner)
+        params = urllib.parse.urlencode({
+            "client_id": client_id,
+            "redirect_uri": _calendar_redirect_uri(request),
+            "response_type": "code",
+            "scope": "https://www.googleapis.com/auth/calendar",
+            "access_type": "offline",
+            "prompt": "consent",
+            "state": state,
+        })
+        return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
+
+    @router.get("/oauth/google/callback")
+    async def calendar_google_oauth_callback(
+        code: str = Query(None),
+        state: str = Query(None),
+        error: str = Query(None),
+        request: Request = None,
+    ):
+        import time
+        from fastapi.responses import RedirectResponse
+        from routes.email_helpers import verify_oauth_state
+        from src.secret_storage import encrypt as _enc
+        from src.google_oauth import exchange_authorization_code, google_client_credentials
+        import httpx as _httpx
+
+        if error:
+            return RedirectResponse("/?section=integrations&calendar_oauth_error=google_error")
+        if not code or not state:
+            return RedirectResponse("/?section=integrations&calendar_oauth_error=missing_code")
+        state_data = verify_oauth_state(state)
+        if not state_data:
+            return RedirectResponse("/?section=integrations&calendar_oauth_error=invalid_state")
+        account_id = state_data.get("a", "")
+        owner = state_data.get("o", "")
+        client_id, client_secret = google_client_credentials()
+        try:
+            data = exchange_authorization_code(
+                client_id, client_secret, code, _calendar_redirect_uri(request))
+        except Exception:
+            logger.warning("Google CalDAV token exchange failed")
+            return RedirectResponse("/?section=integrations&calendar_oauth_error=token_exchange_failed")
+        access_token = data.get("access_token", "")
+        refresh_token = data.get("refresh_token", "")
+        expiry = str(int(time.time()) + data.get("expires_in", 3600))
+        if not access_token:
+            return RedirectResponse("/?section=integrations&calendar_oauth_error=token_exchange_failed")
+
+        email = ""
+        try:
+            ui = _httpx.get("https://www.googleapis.com/oauth2/v1/userinfo",
+                            headers={"Authorization": f"Bearer {access_token}"}, timeout=10)
+            if ui.is_success:
+                email = (ui.json() or {}).get("email", "") or ""
+        except Exception:
+            email = ""
+        if not email:
+            return RedirectResponse("/?section=integrations&calendar_oauth_error=userinfo_failed")
+
+        accounts = _get_caldav_accounts(owner)
+        accounts.append({
+            "id": account_id,
+            "label": email,
+            "auth_mode": "oauth",
+            "oauth_provider": "google",
+            "url": f"https://apidata.googleusercontent.com/caldav/v2/{email}/user",
+            "username": email,
+            "password": "",
+            "oauth_access_token": _enc(access_token),
+            "oauth_refresh_token": _enc(refresh_token) if refresh_token else "",
+            "oauth_token_expiry": expiry,
+        })
+        _save_caldav_accounts(owner, accounts)
+        return RedirectResponse("/?section=integrations&calendar_oauth_success=1")
 
 
     @router.delete("/calendars/{cal_id}")
