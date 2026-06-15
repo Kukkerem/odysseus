@@ -283,7 +283,8 @@ def _should_prune_window(seen_uids: set, parse_failed: bool) -> bool:
     return not parse_failed
 
 
-def _sync_blocking(owner: str, url: str, username: str, password: str, account_id: str = "") -> dict:
+def _sync_blocking(owner: str, url: str, username: str, password: str,
+                   account_id: str = "", access_token: str | None = None) -> dict:
     """The actual sync — synchronous, intended to run in a threadpool.
     Returns counts: {calendars, events, deleted, skipped, errors}."""
     # Lazy imports so a missing `caldav` dep doesn't break app startup —
@@ -293,7 +294,7 @@ def _sync_blocking(owner: str, url: str, username: str, password: str, account_i
 
     result = {"calendars": 0, "events": 0, "deleted": 0, "skipped": 0, "errors": []}
 
-    client = _build_dav_client(url, username, password)
+    client = _build_dav_client(url, username, password, access_token)
 
     # Discovery: try principal → calendars first; if the server doesn't
     # support discovery (or the URL points directly at a calendar), fall
@@ -706,19 +707,33 @@ async def sync_caldav(owner: str) -> dict:
     for acc in accounts:
         url = (acc.get("url") or "").strip()
         user = (acc.get("username") or "").strip()
-        pw = acc.get("password") or ""
         account_id = acc.get("id") or ""
         label = acc.get("label") or url or account_id
-        try:
-            pw = decrypt(pw)
-        except Exception:
-            pass
-        if not (url and user and pw):
-            totals["errors"].append(f"{label}: missing URL, username, or password")
-            continue
+        auth_mode = (acc.get("auth_mode") or "basic").lower()
+        access_token = None
+        pw = ""
+        if auth_mode == "oauth":
+            access_token = _resolve_google_caldav_token(owner, acc)
+            if not access_token:
+                totals["errors"].append(
+                    f"{label}: Google authorization expired — reconnect Google Calendar")
+                continue
+            if not (url and user):
+                totals["errors"].append(f"{label}: missing URL or account email")
+                continue
+        else:
+            pw = acc.get("password") or ""
+            try:
+                pw = decrypt(pw)
+            except Exception:
+                pass
+            if not (url and user and pw):
+                totals["errors"].append(f"{label}: missing URL, username, or password")
+                continue
         try:
             url = validate_caldav_url(url)
-            result = await asyncio.to_thread(_sync_blocking, owner, url, user, pw, account_id)
+            result = await asyncio.to_thread(
+                _sync_blocking, owner, url, user, pw, account_id, access_token)
         except ValueError as e:
             result = {"calendars": 0, "events": 0, "deleted": 0, "errors": [str(e)]}
         except Exception as e:
