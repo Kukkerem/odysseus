@@ -181,6 +181,23 @@ def _find_existing_event(db, pending, uid_val, calendar_id):
     ).first()
 
 
+def _uid_taken_by_other_calendar(db, uid_val) -> bool:
+    """True if ``uid_val`` is already stored under some other calendar.
+
+    CalendarEvent.uid is the global primary key, yet a VEVENT uid legitimately
+    recurs across calendars: the same Holidays subscription under several Google
+    accounts, a calendar shared between two accounts, or a meeting cross-invited
+    between them. _find_existing_event is scoped to the calendar being synced (so
+    we never hijack another calendar's row), so such a uid reaches the insert
+    path as "new" — and inserting it violates the PK. That IntegrityError is
+    caught only per-calendar and rolls back the WHOLE calendar's batch, silently
+    blanking every event in it. The sync uses this check to skip the duplicate
+    instead; the event stays visible under whichever calendar synced it first.
+    """
+    from core.database import CalendarEvent
+    return db.query(CalendarEvent.uid).filter(CalendarEvent.uid == uid_val).first() is not None
+
+
 def _google_caldav_events_url(url: str) -> str | None:
     """Map a Google CalDAV *principal* URL to its event-collection URL.
 
@@ -269,13 +286,13 @@ def _should_prune_window(seen_uids: set, parse_failed: bool) -> bool:
 
 def _sync_blocking(owner: str, url: str, username: str, password: str, account_id: str = "") -> dict:
     """The actual sync — synchronous, intended to run in a threadpool.
-    Returns counts: {calendars, events, deleted, errors}."""
+    Returns counts: {calendars, events, deleted, skipped, errors}."""
     # Lazy imports so a missing `caldav` dep doesn't break app startup —
     # the integrations form still works, sync just no-ops with an error.
     from caldav.lib.error import AuthorizationError, NotFoundError
     from core.database import CalendarCal, CalendarEvent, SessionLocal
 
-    result = {"calendars": 0, "events": 0, "deleted": 0, "errors": []}
+    result = {"calendars": 0, "events": 0, "deleted": 0, "skipped": 0, "errors": []}
 
     client = _build_dav_client(url, username, password)
 
@@ -427,6 +444,16 @@ def _sync_blocking(owner: str, url: str, username: str, password: str, account_i
                             existing.remote_etag = _event_etag(obj) or None
                             existing.caldav_sync_pending = None
                         else:
+                            # Same VEVENT uid already stored under another
+                            # calendar (shared/subscribed calendar, or one
+                            # account that also sees it). uid is the global PK,
+                            # so we cannot insert a second copy; doing so raises
+                            # IntegrityError on commit, which is caught only
+                            # per-calendar and rolls back every event in this
+                            # calendar. Skip the duplicate instead.
+                            if _uid_taken_by_other_calendar(db, uid_val):
+                                result["skipped"] += 1
+                                continue
                             new_ev = CalendarEvent(
                                 uid=uid_val,
                                 calendar_id=local_cal.id,
