@@ -33,6 +33,7 @@ async def test_authorize_redirects_to_google_consent_with_calendar_scope(monkeyp
     assert loc.startswith("https://accounts.google.com/o/oauth2/v2/auth?")
     assert "scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar" in loc
     assert "access_type=offline" in loc
+    assert "calendar+email" in loc
 
 
 @pytest.mark.asyncio
