@@ -3983,10 +3983,16 @@ async function initUnifiedIntegrations() {
   // ── CalDAV form (supports add + edit per account) ──
   async function showCalDavForm(editId) {
     const isNew = !editId || editId === 'new';
+    let _calDavEditingOauth = false;
     formEl.innerHTML = `
       <div class="admin-card" style="margin-top:8px">
         <h2 style="font-size:13px;display:flex;align-items:center;gap:6px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent, var(--red));flex-shrink:0;"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>${isNew ? 'Add CalDAV Calendar' : 'Edit CalDAV Calendar'}</h2>
         <div class="settings-col">
+          <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:4px;">
+            <div style="font-size:11px;font-weight:600;">Google Workspace — primary calendar requires OAuth</div>
+            <div id="uf-caldav-oauth-status" style="font-size:11px;opacity:0.7;"></div>
+            <button type="button" id="uf-caldav-oauth-btn" class="admin-btn-add" style="align-self:flex-start;font-size:11px;background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Connect Google Calendar</button>
+          </div>
           <div class="settings-row"><label class="settings-label">Label</label><input id="uf-caldav-label" class="settings-input" placeholder="e.g. Work, Personal"></div>
           <div class="settings-row"><label class="settings-label">Server URL</label><input id="uf-caldav-url" class="settings-input" placeholder="https://www.google.com/calendar/dav/you@gmail.com/user/"></div>
           <div class="settings-row"><label class="settings-label">Username</label><input id="uf-caldav-user" class="settings-input" placeholder="you@example.com"></div>
@@ -4009,11 +4015,22 @@ async function initUnifiedIntegrations() {
           el('uf-caldav-label').value = acc.label || '';
           el('uf-caldav-url').value = acc.url || '';
           el('uf-caldav-user').value = acc.username || '';
+          _calDavEditingOauth = (acc.auth_mode === 'oauth');
         }
       } catch (_) {}
     }
 
     el('uf-caldav-cancel').addEventListener('click', () => { formEl.style.display = 'none'; });
+    {
+      const oauthStatus = el('uf-caldav-oauth-status');
+      if (oauthStatus) oauthStatus.textContent = _calDavEditingOauth
+        ? '✓ Connected via Google OAuth'
+        : 'Workspace / locked-down accounts: connect with Google instead of an app password.';
+      const oauthBtn = el('uf-caldav-oauth-btn');
+      if (oauthBtn) oauthBtn.addEventListener('click', () => {
+        window.location.href = '/api/calendar/oauth/google/authorize';
+      });
+    }
 
     const _runCalDavTest = async () => {
       const body = {
@@ -5782,12 +5799,13 @@ export function close() {
 // Handle redirect back from Google OAuth2 — open settings to integrations and show status.
 (function _handleOauthRedirect() {
   const sp = new URLSearchParams(window.location.search);
-  if (!sp.has('email_oauth_success') && !sp.has('email_oauth_error')) return;
+  const isCal = sp.has('calendar_oauth_success') || sp.has('calendar_oauth_error');
+  if (!sp.has('email_oauth_success') && !sp.has('email_oauth_error') && !isCal) return;
   // Strip params from URL without a page reload.
   const clean = window.location.pathname + window.location.hash;
   window.history.replaceState(null, '', clean);
-  const success = sp.has('email_oauth_success');
-  const errMsg = sp.get('email_oauth_error') || '';
+  const success = sp.has('email_oauth_success') || sp.has('calendar_oauth_success');
+  const errMsg = sp.get('email_oauth_error') || sp.get('calendar_oauth_error') || '';
   // Open settings → integrations after the app has initialised.
   function _tryOpen() {
     if (window.settingsModule && typeof window.settingsModule.open === 'function') {
@@ -5795,7 +5813,7 @@ export function close() {
       // Brief toast-style banner.
       const banner = document.createElement('div');
       banner.textContent = success
-        ? '✓ Google account connected — email is ready'
+        ? (isCal ? '✓ Google Calendar connected' : '✓ Google account connected — email is ready')
         : `Google OAuth failed: ${errMsg || 'unknown error'}`;
       Object.assign(banner.style, {
         position: 'fixed', bottom: '24px', left: '50%', transform: 'translateX(-50%)',
