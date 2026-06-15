@@ -869,7 +869,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
                 raise HTTPException(403, "Access denied")
         finally:
             db.close()
-        started = await task_scheduler.run_task_now(task_id, force=force)
+        started = await task_scheduler.run_task_now(task_id, force=force, manual=True)
         if not started:
             raise HTTPException(409, "Task is already running")
         return {"ok": True, "message": "Task triggered" + (" in parallel" if force else "")}
