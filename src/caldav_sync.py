@@ -245,28 +245,26 @@ def _open_url_as_calendar(client, url: str):
     return client.calendar(url=target)
 
 
-def _build_dav_client(url: str, username: str, password: str):
+def _build_dav_client(url: str, username: str, password: str, access_token: str | None = None):
     """Construct a CalDAV client with automatic redirects disabled.
 
-    ``validate_caldav_url`` resolves and vets the *initial* host, but caldav's
-    underlying HTTP session follows 3xx redirects by default. So a URL that
-    passes validation can still be redirected — at request time — to
-    loopback / link-local / private space, re-opening the SSRF the host check
-    closes. Pin the session to zero redirects: any 3xx then raises instead of
-    silently following an attacker-chosen ``Location``. This mirrors the
-    test-connection path in ``routes/calendar_routes.py``, which already sets
-    ``follow_redirects=False``.
+    Basic auth (username/password) for most servers. When ``access_token`` is
+    given (Google OAuth), authenticate with a Bearer token instead: set the
+    Authorization header on the caldav client's own header set, which
+    ``DAVClient._prepare_request`` merges into every request. This is version-
+    robust — unlike ``auth_type=\"bearer\"`` / ``caldav.requests.HTTPBearerAuth``,
+    which exist only in caldav 2.x.
 
-    DAVClient exposes no per-request redirect flag, so we set it on the session
-    after construction (the session is created in ``__init__``).
+    Redirects are pinned to zero (set on the session, created in ``__init__``)
+    so a validated public host cannot be redirected, at request time, into
+    loopback/private space — the SSRF the host check closes.
     """
     import caldav
 
-    client = caldav.DAVClient(url=url, username=username, password=password)
-    # Unconditional: a redirect-disable that only sometimes applies is not a
-    # control. The session exists right after __init__ on every real client;
-    # test_build_dav_client_disables_redirects asserts it against installed
-    # caldav in CI.
+    kwargs = {} if access_token else {"username": username, "password": password}
+    client = caldav.DAVClient(url=url, **kwargs)
+    if access_token:
+        client.headers["Authorization"] = f"Bearer {access_token}"
     client.session.max_redirects = 0
     return client
 
