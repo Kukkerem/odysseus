@@ -90,3 +90,43 @@ def test_resolve_token_returns_none_when_refresh_fails(monkeypatch):
     monkeypatch.setattr("src.google_oauth.exchange_refresh_token", _boom)
 
     assert caldav_sync._resolve_google_caldav_token("alice", acc) is None
+
+
+# --- Task 5: sync threading ---
+import asyncio
+
+
+def test_sync_caldav_oauth_resolves_token_and_passes_it(monkeypatch):
+    """An OAuth account resolves a token and hands it to _sync_blocking; no
+    password is required."""
+    acc = {
+        "id": "acc-o", "label": "Work", "auth_mode": "oauth", "oauth_provider": "google",
+        "url": "https://apidata.googleusercontent.com/caldav/v2/me@x.com/user",
+        "username": "me@x.com",
+    }
+    monkeypatch.setattr(caldav_sync, "_load_caldav_accounts", lambda o: [acc])
+    monkeypatch.setattr(caldav_sync, "_resolve_google_caldav_token", lambda o, a: "ya29.live")
+    seen = {}
+
+    def _fake_blocking(owner, url, username, password, account_id="", access_token=None):
+        seen.update(url=url, username=username, password=password,
+                    account_id=account_id, access_token=access_token)
+        return {"calendars": 1, "events": 3, "deleted": 0, "errors": []}
+
+    monkeypatch.setattr(caldav_sync, "_sync_blocking", _fake_blocking)
+    out = asyncio.run(caldav_sync.sync_caldav("alice"))
+    assert out["events"] == 3
+    assert seen["access_token"] == "ya29.live"
+    assert seen["password"] == ""  # OAuth carries no password
+
+
+def test_sync_caldav_oauth_unresolvable_token_surfaces_reconnect(monkeypatch):
+    acc = {"id": "acc-o", "label": "Work", "auth_mode": "oauth", "oauth_provider": "google",
+           "url": "https://apidata.googleusercontent.com/caldav/v2/me@x.com/user",
+           "username": "me@x.com"}
+    monkeypatch.setattr(caldav_sync, "_load_caldav_accounts", lambda o: [acc])
+    monkeypatch.setattr(caldav_sync, "_resolve_google_caldav_token", lambda o, a: None)
+    monkeypatch.setattr(caldav_sync, "_sync_blocking",
+                        mock.MagicMock(side_effect=AssertionError("must not sync")))
+    out = asyncio.run(caldav_sync.sync_caldav("alice"))
+    assert any("reconnect" in e.lower() for e in out["errors"])
