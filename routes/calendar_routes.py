@@ -922,7 +922,7 @@ def setup_calendar_routes() -> APIRouter:
             "client_id": client_id,
             "redirect_uri": _calendar_redirect_uri(request),
             "response_type": "code",
-            "scope": "https://www.googleapis.com/auth/calendar",
+            "scope": "https://www.googleapis.com/auth/calendar email",
             "access_type": "offline",
             "prompt": "consent",
             "state": state,
