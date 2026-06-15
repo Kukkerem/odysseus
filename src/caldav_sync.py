@@ -235,6 +235,17 @@ def _google_caldav_events_url(url: str) -> str | None:
     return urlunparse(parts._replace(path=new_path))
 
 
+def _is_google_host(url: str) -> bool:
+    """True for either Google CalDAV endpoint form (legacy www.google.com or
+    the v2 apidata host)."""
+    parts = urlparse(url)
+    host = (parts.hostname or "").lower()
+    return (
+        host.endswith("googleusercontent.com")
+        or (host in ("www.google.com", "google.com") and "/calendar/dav/" in parts.path)
+    )
+
+
 def _open_url_as_calendar(client, url: str):
     """Open ``url`` as a single calendar collection.
 
@@ -306,7 +317,12 @@ def _sync_blocking(owner: str, url: str, username: str, password: str,
             principal = client.principal()
             calendars = principal.calendars()
         except (AuthorizationError, NotFoundError) as e:
-            result["errors"].append(f"Discovery failed: {e}")
+            if access_token is None and _is_google_host(url):
+                result["errors"].append(
+                    "Google rejected the app password (v2 CalDAV requires OAuth). "
+                    "Use 'Connect Google Calendar'.")
+            else:
+                result["errors"].append(f"Discovery failed: {e}")
             return result          # outer finally will call client.close()
         except Exception as e:
             logger.info(f"CalDAV principal discovery failed, trying URL as calendar: {e}")
@@ -379,6 +395,14 @@ def _sync_blocking(owner: str, url: str, username: str, password: str,
                     parse_failed = False
                     try:
                         objs = remote_cal.date_search(start=start, end=end, expand=False)
+                    except NotFoundError as e:
+                        if access_token is None and _is_google_host(url):
+                            result["errors"].append(
+                                f"{display_name}: primary calendar rejected basic-auth CalDAV — "
+                                "this Google Workspace account needs OAuth. Use 'Connect Google Calendar'.")
+                        else:
+                            result["errors"].append(f"{display_name}: date_search failed ({e})")
+                        continue
                     except Exception as e:
                         result["errors"].append(f"{display_name}: date_search failed ({e})")
                         continue
