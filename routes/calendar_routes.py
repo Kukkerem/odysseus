@@ -731,6 +731,7 @@ def setup_calendar_routes() -> APIRouter:
                 "url": acc.get("url", "") or "",
                 "username": acc.get("username", "") or "",
                 "has_password": has_pw,
+                "auth_mode": acc.get("auth_mode", "basic"),
             })
         return {"accounts": safe}
 
