@@ -18,7 +18,7 @@ network.
 
 import asyncio
 import logging
-from datetime import timezone
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +66,27 @@ def build_event_ical(ev: dict) -> str:
         ve.add("dtend", dtend)
 
     if ev.get("rrule"):
+        # The stored value may be an RRULE-content block with EXDATE lines
+        # appended by CalDAV sync (#3762) — split it back into the RRULE
+        # property and individual EXDATE properties.
+        lines = [ln.strip() for ln in str(ev["rrule"]).splitlines() if ln.strip()]
         try:
-            ve.add("rrule", vRecur.from_ical(ev["rrule"]))
+            ve.add("rrule", vRecur.from_ical(lines[0].removeprefix("RRULE:")))
         except Exception:
             logger.debug("CalDAV write-back: skipping unparseable rrule %r", ev.get("rrule"))
+        for line in lines[1:]:
+            if not line.upper().startswith("EXDATE"):
+                continue
+            value = line.split(":", 1)[1] if ":" in line else ""
+            try:
+                stamp = (
+                    datetime.strptime(value, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+                    if "T" in value
+                    else datetime.strptime(value, "%Y%m%d").date()
+                )
+                ve.add("exdate", stamp)
+            except Exception:
+                logger.debug("CalDAV write-back: skipping unparseable exdate %r", line)
 
     cal.add_component(ve)
     return cal.to_ical().decode("utf-8")

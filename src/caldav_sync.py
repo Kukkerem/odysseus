@@ -163,6 +163,93 @@ def _to_utc_naive(dt):
     return datetime(dt.year, dt.month, dt.day), True
 
 
+def _event_fields_from_component(comp):
+    """Extract the CalendarEvent column values from one VEVENT component.
+
+    Returns None when the component has no DTSTART (nothing renderable).
+    Shared by the series-master and RECURRENCE-ID-override ingestion paths
+    so both store identical time/text semantics.
+    """
+    dtstart_p = comp.get("dtstart")
+    if not dtstart_p:
+        return None
+    start_dt, all_day = _to_utc_naive(dtstart_p.dt)
+
+    dtend_p = comp.get("dtend")
+    if dtend_p:
+        end_dt, _ = _to_utc_naive(dtend_p.dt)
+    elif all_day:
+        end_dt = start_dt + timedelta(days=1)
+    else:
+        end_dt = start_dt + timedelta(hours=1)
+
+    # is_utc reflects whether the source carried a TZ we converted from.
+    # All-day = no TZ semantics.
+    row_is_utc = (
+        not all_day
+        and isinstance(dtstart_p.dt, datetime)
+        and dtstart_p.dt.tzinfo is not None
+    )
+    return {
+        "dtstart": start_dt,
+        "dtend": end_dt,
+        "all_day": all_day,
+        "is_utc": row_is_utc,
+        "summary": str(comp.get("summary", "")),
+        "description": str(comp.get("description", "")),
+        "location": str(comp.get("location", "")),
+        "rrule": (
+            comp.get("rrule").to_ical().decode() if comp.get("rrule") else ""
+        ),
+    }
+
+
+def _exdate_stamp(dt) -> str:
+    """UTC-naive EXDATE value matching the dtstart storage semantics."""
+    moment, day_only = _to_utc_naive(dt)
+    return moment.strftime("%Y%m%d") if day_only else moment.strftime("%Y%m%dT%H%M%S")
+
+
+def _exdate_lines(comp, override_comps) -> list:
+    """EXDATE lines to append to a series master's stored rrule (#3762).
+
+    Combines the component's own EXDATE values with the RECURRENCE-ID of
+    every override component: overrides are stored as standalone rows, so
+    the master must not also expand the original slot. Values use the same
+    UTC-naive conversion as dtstart, and the resulting ``RRULE-content +
+    EXDATE lines`` block is exactly what dateutil's ``rrulestr`` parses
+    into an exclusion-aware ``rruleset`` at expansion time.
+    """
+    stamps = []
+    ex = comp.get("exdate")
+    if ex is not None:
+        for chunk in (ex if isinstance(ex, list) else [ex]):
+            for v in getattr(chunk, "dts", None) or []:
+                stamps.append(_exdate_stamp(v.dt))
+    for oc in override_comps:
+        rid = oc.get("recurrence-id")
+        if rid is not None:
+            stamps.append(_exdate_stamp(rid.dt))
+    lines = []
+    for stamp in stamps:
+        line = f"EXDATE:{stamp}"
+        if line not in lines:
+            lines.append(line)
+    return lines
+
+
+def _override_uid(uid_val: str, comp) -> str:
+    """Stable row uid for a RECURRENCE-ID override occurrence.
+
+    Deliberately does NOT use the ``{base}::{suffix}`` compound form: that
+    form is reserved for expanded occurrences, and _expand_rrule's compound
+    uid would strip the suffix and retarget edits/deletes at the series
+    master row.
+    """
+    rid = comp.get("recurrence-id")
+    return f"{uid_val}--override--{_exdate_stamp(rid.dt)}"
+
+
 def _find_existing_event(db, pending, uid_val, calendar_id):
     """Find the event to update for THIS calendar.
 
@@ -484,43 +571,27 @@ def _sync_blocking(owner: str, url: str, username: str, password: str,
                         parse_failed = True
                         continue
 
+                    # Group this object's VEVENTs by uid before writing:
+                    # a recurring series ships its master plus optional
+                    # RECURRENCE-ID override components under ONE uid, and
+                    # processing them independently made whichever walked
+                    # last overwrite the other's row — an override (no
+                    # RRULE) silently collapsed the whole series to a
+                    # single occurrence (#3762). Grouping also makes the
+                    # reconciliation independent of component order.
+                    obj_masters: dict = {}
+                    obj_overrides: dict = {}
                     for comp in ical.walk():
                         if comp.name != "VEVENT":
                             continue
                         uid_val = str(comp.get("uid", "")) or str(uuid.uuid4())
-                        seen_uids.add(uid_val)
+                        if comp.get("recurrence-id") is not None:
+                            obj_overrides.setdefault(uid_val, []).append(comp)
+                        elif uid_val not in obj_masters:
+                            obj_masters[uid_val] = comp
 
-                        dtstart_p = comp.get("dtstart")
-                        if not dtstart_p:
-                            continue
-                        start_dt, all_day = _to_utc_naive(dtstart_p.dt)
-
-                        dtend_p = comp.get("dtend")
-                        if dtend_p:
-                            end_dt, _ = _to_utc_naive(dtend_p.dt)
-                        elif all_day:
-                            end_dt = start_dt + timedelta(days=1)
-                        else:
-                            end_dt = start_dt + timedelta(hours=1)
-
-                        # is_utc reflects whether the source carried a TZ
-                        # we converted from. All-day = no TZ semantics.
-                        row_is_utc = (
-                            not all_day
-                            and isinstance(dtstart_p.dt, datetime)
-                            and dtstart_p.dt.tzinfo is not None
-                        )
-
-                        summary = str(comp.get("summary", ""))
-                        description = str(comp.get("description", ""))
-                        location = str(comp.get("location", ""))
-                        rrule = (
-                            comp.get("rrule").to_ical().decode()
-                            if comp.get("rrule")
-                            else ""
-                        )
-
-                        existing = _find_existing_event(db, pending, uid_val, local_cal.id)
+                    def _upsert(row_uid: str, fields: dict):
+                        existing = _find_existing_event(db, pending, row_uid, local_cal.id)
                         if existing:
                             # Read-only calendars are remote-authoritative: a
                             # local edit can never be pushed, so honouring its
@@ -528,16 +599,10 @@ def _sync_blocking(owner: str, url: str, username: str, password: str,
                             # Overwrite from the server and clear the flag.
                             if existing.caldav_sync_pending in {"create", "update"} and not read_only:
                                 result["events"] += 1
-                                continue
+                                return
                             existing.calendar_id = local_cal.id
-                            existing.summary = summary
-                            existing.description = description
-                            existing.location = location
-                            existing.dtstart = start_dt
-                            existing.dtend = end_dt
-                            existing.all_day = all_day
-                            existing.is_utc = row_is_utc
-                            existing.rrule = rrule
+                            for key, value in fields.items():
+                                setattr(existing, key, value)
                             existing.origin = "caldav"
                             existing.remote_href = str(getattr(obj, "url", "") or "") or None
                             existing.remote_etag = _event_etag(obj) or None
@@ -550,27 +615,49 @@ def _sync_blocking(owner: str, url: str, username: str, password: str,
                             # IntegrityError on commit, which is caught only
                             # per-calendar and rolls back every event in this
                             # calendar. Skip the duplicate instead.
-                            if _uid_taken_by_other_calendar(db, uid_val):
+                            if _uid_taken_by_other_calendar(db, row_uid):
                                 result["skipped"] += 1
-                                continue
+                                return
                             new_ev = CalendarEvent(
-                                uid=uid_val,
+                                uid=row_uid,
                                 calendar_id=local_cal.id,
-                                summary=summary,
-                                description=description,
-                                location=location,
-                                dtstart=start_dt,
-                                dtend=end_dt,
-                                all_day=all_day,
-                                is_utc=row_is_utc,
-                                rrule=rrule,
                                 origin="caldav",
                                 remote_href=str(getattr(obj, "url", "") or "") or None,
                                 remote_etag=_event_etag(obj) or None,
+                                **fields,
                             )
                             db.add(new_ev)
-                            pending[uid_val] = new_ev
+                            pending[row_uid] = new_ev
                         result["events"] += 1
+
+                    for uid_val, comp in obj_masters.items():
+                        fields = _event_fields_from_component(comp)
+                        if fields is None:
+                            continue
+                        seen_uids.add(uid_val)
+                        # Persist exclusions next to the RRULE content; the
+                        # expansion side (rrulestr) parses the combined block
+                        # into an exclusion-aware rruleset.
+                        if fields["rrule"]:
+                            ex_lines = _exdate_lines(comp, obj_overrides.get(uid_val, []))
+                            if ex_lines:
+                                fields["rrule"] = "\n".join([fields["rrule"], *ex_lines])
+                        _upsert(uid_val, fields)
+
+                    for uid_val, comps in obj_overrides.items():
+                        for comp in comps:
+                            fields = _event_fields_from_component(comp)
+                            if fields is None:
+                                continue
+                            # An override is a standalone occurrence, never a
+                            # series of its own.
+                            fields["rrule"] = ""
+                            row_uid = _override_uid(uid_val, comp)
+                            seen_uids.add(row_uid)
+                            # The base uid must survive the prune even when the
+                            # master sits outside the sync window.
+                            seen_uids.add(uid_val)
+                            _upsert(row_uid, fields)
                 db.commit()
 
                 # Prune locally-cached CalDAV events that vanished
