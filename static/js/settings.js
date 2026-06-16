@@ -3956,56 +3956,108 @@ async function initUnifiedIntegrations() {
   // ── CalDAV form (supports add + edit per account) ──
   async function showCalDavForm(editId) {
     const isNew = !editId || editId === 'new';
-    let _calDavEditingOauth = false;
-    formEl.innerHTML = `
-      <div class="admin-card" style="margin-top:8px">
-        <h2 style="font-size:13px;display:flex;align-items:center;gap:6px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent, var(--red));flex-shrink:0;"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>${isNew ? 'Add CalDAV Calendar' : 'Edit CalDAV Calendar'}</h2>
-        <div class="settings-col">
-          <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:4px;">
-            <div style="font-size:11px;font-weight:600;">Google Workspace — primary calendar requires OAuth</div>
-            <div id="uf-caldav-oauth-status" style="font-size:11px;opacity:0.7;"></div>
-            <button type="button" id="uf-caldav-oauth-btn" class="admin-btn-add" style="align-self:flex-start;font-size:11px;background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Connect Google Calendar</button>
-          </div>
-          <div class="settings-row"><label class="settings-label">Label</label><input id="uf-caldav-label" class="settings-input" placeholder="e.g. Work, Personal"></div>
-          <div class="settings-row"><label class="settings-label">Server URL</label><input id="uf-caldav-url" class="settings-input" placeholder="https://www.google.com/calendar/dav/you@gmail.com/user/"></div>
-          <div class="settings-row"><label class="settings-label">Username</label><input id="uf-caldav-user" class="settings-input" placeholder="you@example.com"></div>
-          <div class="settings-row"><label class="settings-label">Password</label><input id="uf-caldav-pass" class="settings-input" type="password" placeholder="${isNew ? '' : 'Leave blank to keep existing'}"></div>
-          <div class="settings-row" style="align-items:center;"><label class="settings-label" for="uf-caldav-readonly">Read-only</label><label style="display:flex;align-items:center;gap:8px;font-size:11px;opacity:0.8;flex:1;cursor:pointer;"><input id="uf-caldav-readonly" type="checkbox" style="width:auto;flex:none;margin:0;">Sync events in, but don't push my changes back to this server.</label></div>
-          <div class="settings-row" style="margin-top:10px;align-items:center;justify-content:flex-end;gap:6px;">
-            <span id="uf-caldav-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
-            <button class="admin-btn-add" id="uf-caldav-test" style="display:inline-flex;align-items:center;gap:5px;background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Test</button>
-            <button class="admin-btn-add" id="uf-caldav-save" style="display:inline-flex;align-items:center;gap:5px;background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));font-weight:600;">Save</button>
-            <button class="admin-btn-add" id="uf-caldav-cancel" style="display:inline-flex;align-items:center;gap:5px;background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Cancel</button>
-          </div>
-        </div>
-      </div>`;
-
+    let acc = null;
     if (!isNew) {
       try {
         const r = await fetch('/api/calendar/config/accounts', { credentials: 'same-origin' });
         const d = await r.json();
-        const acc = (d.accounts || []).find(a => a.id === editId);
-        if (acc) {
-          el('uf-caldav-label').value = acc.label || '';
-          el('uf-caldav-url').value = acc.url || '';
-          el('uf-caldav-user').value = acc.username || '';
-          _calDavEditingOauth = (acc.auth_mode === 'oauth');
-          el('uf-caldav-readonly').checked = !!acc.read_only;
-        }
+        acc = (d.accounts || []).find(a => a.id === editId) || null;
       } catch (_) {}
     }
+    const isOauth = !!(acc && acc.auth_mode === 'oauth');
+    const isConnected = !!(acc && acc.connected);
+    const redirectUri = window.location.origin + '/api/calendar/oauth/google/callback';
+    const _btnStyle = 'display:inline-flex;align-items:center;gap:5px;background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));';
+    formEl.innerHTML = `
+      <div class="admin-card" style="margin-top:8px">
+        <h2 style="font-size:13px;display:flex;align-items:center;gap:6px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent, var(--red));flex-shrink:0;"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>${isNew ? 'Add CalDAV Calendar' : 'Edit CalDAV Calendar'}</h2>
+        <div class="settings-col">
+          <div class="settings-row" style="align-items:center;gap:14px;">
+            <label class="settings-label">Auth method</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:11px;cursor:pointer;"><input type="radio" name="uf-caldav-mode" id="uf-caldav-mode-basic" value="basic" style="width:auto;flex:none;margin:0;">App password</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:11px;cursor:pointer;"><input type="radio" name="uf-caldav-mode" id="uf-caldav-mode-oauth" value="oauth" style="width:auto;flex:none;margin:0;">Google (OAuth)</label>
+          </div>
+          <div class="settings-row"><label class="settings-label">Label</label><input id="uf-caldav-label" class="settings-input" placeholder="e.g. Work, Personal"></div>
+          <div id="uf-caldav-basic-fields">
+            <div class="settings-row"><label class="settings-label">Server URL</label><input id="uf-caldav-url" class="settings-input" placeholder="https://www.google.com/calendar/dav/you@gmail.com/user/"></div>
+            <div class="settings-row"><label class="settings-label">Username</label><input id="uf-caldav-user" class="settings-input" placeholder="you@example.com"></div>
+            <div class="settings-row"><label class="settings-label">Password</label><input id="uf-caldav-pass" class="settings-input" type="password" placeholder="${isNew ? '' : 'Leave blank to keep existing'}"></div>
+          </div>
+          <div id="uf-caldav-oauth-fields" style="display:none;">
+            <div id="uf-caldav-oauth-status" style="font-size:11px;opacity:0.75;margin-bottom:6px;"></div>
+            <div style="font-size:11px;opacity:0.7;margin-bottom:6px;">Bring your own Google OAuth client (one per Google Cloud project) so a personal and a work account each authorize against their own app. Leave blank to use this server's configured client.</div>
+            <div class="settings-row"><label class="settings-label">Client ID</label><input id="uf-caldav-client-id" class="settings-input" autocomplete="off" placeholder="${(acc && acc.oauth_client_id) ? esc(acc.oauth_client_id) : '…apps.googleusercontent.com'}"></div>
+            <div class="settings-row"><label class="settings-label">Client secret</label><input id="uf-caldav-client-secret" class="settings-input" type="password" autocomplete="off" placeholder="${(acc && acc.has_oauth_client) ? 'Configured — leave blank to keep' : ''}"></div>
+            <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:4px;"><label class="settings-label" style="text-align:left;">…or paste client JSON</label><textarea id="uf-caldav-client-json" class="settings-input" rows="2" placeholder="Paste the downloaded client_secret_*.json — fills the two fields above" style="font-family:var(--mono, monospace);font-size:10px;"></textarea></div>
+            <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:4px;"><div style="font-size:11px;opacity:0.7;">Add this exact redirect URI to your OAuth client's <b>Authorized redirect URIs</b> (Google Cloud → Credentials):</div><code style="font-size:10px;word-break:break-all;background:color-mix(in srgb, var(--fg) 8%, transparent);padding:4px 6px;border-radius:4px;">${esc(redirectUri)}</code></div>
+          </div>
+          <div class="settings-row" style="align-items:center;"><label class="settings-label" for="uf-caldav-readonly">Read-only</label><label style="display:flex;align-items:center;gap:8px;font-size:11px;opacity:0.8;flex:1;cursor:pointer;"><input id="uf-caldav-readonly" type="checkbox" style="width:auto;flex:none;margin:0;">Sync events in, but don't push my changes back to this server.</label></div>
+          <div class="settings-row" style="margin-top:10px;align-items:center;justify-content:flex-end;gap:6px;">
+            <span id="uf-caldav-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
+            <button class="admin-btn-add" id="uf-caldav-test" style="${_btnStyle}">Test</button>
+            <button class="admin-btn-add" id="uf-caldav-connect" style="display:none;${_btnStyle}font-weight:600;">Connect</button>
+            <button class="admin-btn-add" id="uf-caldav-save" style="${_btnStyle}font-weight:600;">Save</button>
+            <button class="admin-btn-add" id="uf-caldav-cancel" style="${_btnStyle}">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+
+    el('uf-caldav-label').value = (acc && acc.label) || '';
+    el('uf-caldav-url').value = (acc && acc.url) || '';
+    el('uf-caldav-user').value = (acc && acc.username) || '';
+    el('uf-caldav-readonly').checked = acc ? !!acc.read_only : false;
+    el('uf-caldav-mode-basic').checked = !isOauth;
+    el('uf-caldav-mode-oauth').checked = isOauth;
+
+    const _setCalDavMsg = (text, ok) => {
+      const msg = el('uf-caldav-msg');
+      msg.textContent = text;
+      msg.style.color = ok ? 'var(--green, #50fa7b)' : 'var(--red)';
+    };
+
+    const _applyMode = () => {
+      const oauth = el('uf-caldav-mode-oauth').checked;
+      el('uf-caldav-basic-fields').style.display = oauth ? 'none' : '';
+      el('uf-caldav-oauth-fields').style.display = oauth ? '' : 'none';
+      el('uf-caldav-test').style.display = oauth ? 'none' : '';
+      // Connect runs the consent flow against a saved draft — new accounts
+      // must Save first (two-step), so it only shows in edit mode.
+      el('uf-caldav-connect').style.display = (oauth && !isNew) ? '' : 'none';
+      el('uf-caldav-connect').textContent = isConnected ? 'Reconnect' : 'Connect';
+      const st = el('uf-caldav-oauth-status');
+      if (st) st.textContent = isConnected
+        ? '✓ Connected via Google OAuth'
+        : (isNew ? 'Save this calendar, then Connect to authorize with Google.'
+                 : 'Not connected yet — click Connect to authorize with Google.');
+    };
+    el('uf-caldav-mode-basic').addEventListener('change', _applyMode);
+    el('uf-caldav-mode-oauth').addEventListener('change', () => {
+      // New OAuth accounts default to pull-only until the user says otherwise.
+      if (isNew && !el('uf-caldav-readonly').dataset.touched) el('uf-caldav-readonly').checked = true;
+      _applyMode();
+    });
+    el('uf-caldav-readonly').addEventListener('change', () => { el('uf-caldav-readonly').dataset.touched = '1'; });
+    _applyMode();
+
+    // Paste-the-whole-JSON convenience: fill the two fields client-side. The
+    // server re-parses authoritatively, so a partial/odd paste is harmless.
+    const cjEl = el('uf-caldav-client-json');
+    if (cjEl) cjEl.addEventListener('input', () => {
+      const raw = cjEl.value.trim();
+      if (!raw) return;
+      try {
+        const o = JSON.parse(raw);
+        const inner = o.web || o.installed || o;
+        if (inner && inner.client_id && inner.client_secret) {
+          el('uf-caldav-client-id').value = inner.client_id;
+          el('uf-caldav-client-secret').value = inner.client_secret;
+          cjEl.value = '';
+          _setCalDavMsg('Client credentials read from JSON', true);
+        }
+      } catch (_) { /* incomplete paste — wait for more input */ }
+    });
 
     el('uf-caldav-cancel').addEventListener('click', () => { formEl.style.display = 'none'; });
-    {
-      const oauthStatus = el('uf-caldav-oauth-status');
-      if (oauthStatus) oauthStatus.textContent = _calDavEditingOauth
-        ? '✓ Connected via Google OAuth'
-        : 'Workspace / locked-down accounts: connect with Google instead of an app password.';
-      const oauthBtn = el('uf-caldav-oauth-btn');
-      if (oauthBtn) oauthBtn.addEventListener('click', () => {
-        window.location.href = '/api/calendar/oauth/google/authorize';
-      });
-    }
 
     const _runCalDavTest = async () => {
       const body = {
@@ -4026,13 +4078,53 @@ async function initUnifiedIntegrations() {
       }
     };
 
-    const _setCalDavMsg = (text, ok) => {
-      const msg = el('uf-caldav-msg');
-      msg.textContent = text;
-      msg.style.color = ok ? 'var(--green, #50fa7b)' : 'var(--red)';
+    const _buildOauthPayload = () => {
+      const payload = {
+        auth_mode: 'oauth',
+        label: el('uf-caldav-label').value.trim(),
+        read_only: el('uf-caldav-readonly').checked,
+      };
+      const cj = el('uf-caldav-client-json').value.trim();
+      const cid = el('uf-caldav-client-id').value.trim();
+      const csec = el('uf-caldav-client-secret').value;
+      // Send creds only when the user supplied them, so editing label/read-only
+      // on an already-configured account keeps its stored client untouched.
+      if (cj) payload.oauth_client_json = cj;
+      else if (cid || csec) { payload.oauth_client_id = cid; payload.oauth_client_secret = csec; }
+      return payload;
+    };
+
+    const _saveAccount = async (payload) => {
+      const url = isNew ? '/api/calendar/config/accounts' : `/api/calendar/config/accounts/${editId}`;
+      const resp = await fetch(url, {
+        method: isNew ? 'POST' : 'PUT', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || 'Save failed');
+      }
+      return await resp.json().catch(() => ({}));
     };
 
     el('uf-caldav-save').addEventListener('click', async () => {
+      if (el('uf-caldav-mode-oauth').checked) {
+        // OAuth draft: no live test (no url/password yet) — just persist.
+        try {
+          const data = await _saveAccount(_buildOauthPayload());
+          await renderList();
+          notifyIntegrationsChanged();
+          if (isNew && data.id) {
+            // Reopen in edit mode so the Connect step targets the new draft.
+            formEl.style.display = '';
+            showCalDavForm(data.id);
+          } else {
+            formEl.style.display = 'none';
+          }
+        } catch (e) { _setCalDavMsg(e.message || 'Save failed', false); }
+        return;
+      }
       _setCalDavMsg('Testing…', true);
       el('uf-caldav-msg').style.color = '';
       const d = await _runCalDavTest();
@@ -4041,39 +4133,27 @@ async function initUnifiedIntegrations() {
         return;
       }
       try {
-        const payload = {
+        await _saveAccount({
           label: el('uf-caldav-label').value.trim(),
           url: el('uf-caldav-url').value.trim(),
           username: el('uf-caldav-user').value.trim(),
           password: el('uf-caldav-pass').value,
           read_only: el('uf-caldav-readonly').checked,
-        };
-        let resp;
-        if (isNew) {
-          resp = await fetch('/api/calendar/config/accounts', {
-            method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          });
-        } else {
-          resp = await fetch(`/api/calendar/config/accounts/${editId}`, {
-            method: 'PUT', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          });
-        }
-        if (!resp.ok) {
-          const err = await resp.json().catch(() => ({}));
-          _setCalDavMsg(err.detail || 'Save failed', false);
-          return;
-        }
+        });
         _setCalDavMsg('Saved', true);
         formEl.style.display = 'none';
         await renderList();
         notifyIntegrationsChanged();
-      } catch (_) {
-        _setCalDavMsg('Save failed', false);
-      }
+      } catch (e) { _setCalDavMsg(e.message || 'Save failed', false); }
+    });
+
+    el('uf-caldav-connect').addEventListener('click', async () => {
+      if (isNew) return;
+      // Persist any client/label/read-only edits, then run the consent flow.
+      try {
+        await _saveAccount(_buildOauthPayload());
+      } catch (e) { _setCalDavMsg(e.message || 'Save failed', false); return; }
+      window.location.href = `/api/calendar/oauth/google/authorize?account_id=${encodeURIComponent(editId)}`;
     });
 
     el('uf-caldav-test').addEventListener('click', async () => {

@@ -340,11 +340,26 @@ Google Cloud project** you use for Gmail OAuth:
    public origin behind a reverse proxy — see `GOOGLE_CALENDAR_OAUTH_REDIRECT_URI`
    in `.env.example`).
 
-Then in **Settings → Integrations → Add CalDAV Calendar**, click **Connect
-Google Calendar**. The callback auto-fills the v2 endpoint and account email and
-stores the OAuth tokens (encrypted) — no URL or app password needed. Existing
-non-Google CalDAV servers (Nextcloud, Fastmail, Apple, Radicale) keep using
-basic auth unchanged.
+Then in **Settings → Integrations → Add CalDAV Calendar**, set **Auth method** to
+**Google (OAuth)**, **Save**, then click **Connect**. The callback auto-fills the
+v2 endpoint and account email and stores the OAuth tokens (encrypted) — no URL or
+app password needed. Existing non-Google CalDAV servers (Nextcloud, Fastmail,
+Apple, Radicale) keep using basic auth unchanged.
+
+#### Per-account OAuth client (personal + work)
+The single instance-wide `GOOGLE_OAUTH_CLIENT_ID` cannot connect a **personal**
+`@gmail.com` and a **work** Workspace account at once: a client's consent screen
+is either **Internal** (Workspace-only — rejects personal accounts with
+`Error 403: org_internal`) or **External** (rejects accounts that aren't published
+or added as test users). To connect both, give each calendar **its own** OAuth
+client (one per Google Cloud project): in the **Google (OAuth)** form, paste the
+**Client ID** + **Client secret** (or the downloaded `client_secret_*.json`), then
+**Save** and **Connect**. Leave those fields blank to use the instance-wide client.
+
+The client secret is encrypted at rest and never returned by the API. **Each**
+OAuth client you use must list the exact redirect URI shown in the form under its
+**Authorized redirect URIs** (Google Cloud → Credentials), or Google rejects the
+consent with `redirect_uri_mismatch`.
 
 ## Security Notes
 Odysseus is a self-hosted workspace with powerful local tools: shell access, file uploads, model downloads, web research, email/calendar integrations, and API tokens. Treat it like an admin console.

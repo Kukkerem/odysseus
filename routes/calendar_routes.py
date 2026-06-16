@@ -669,6 +669,30 @@ def setup_calendar_routes() -> APIRouter:
         prefs.pop("caldav", None)
         _save_for_user(owner, prefs)
 
+    def _resolve_client_creds(body: dict) -> tuple[str, str]:
+        """Resolve a per-account Google OAuth client from a request body into
+        (client_id, encrypted_secret). Accepts a pasted ``oauth_client_json``
+        (Google's downloaded client_secret_*.json) or explicit
+        ``oauth_client_id`` + ``oauth_client_secret`` fields. Returns ("", "")
+        when none are supplied (the instance/env client is used). Raises
+        HTTPException(400) on malformed JSON or a half-filled pair."""
+        from src.secret_storage import encrypt
+        raw = (body.get("oauth_client_json") or "").strip()
+        if raw:
+            from src.google_oauth import parse_client_json
+            try:
+                cid, csec = parse_client_json(raw)
+            except ValueError as e:
+                raise HTTPException(400, f"Could not read client JSON: {e}")
+            return cid, encrypt(csec)
+        cid = (body.get("oauth_client_id") or "").strip()
+        csec = (body.get("oauth_client_secret") or "").strip()
+        if cid and csec:
+            return cid, encrypt(csec)
+        if cid or csec:
+            raise HTTPException(400, "Both client ID and client secret are required")
+        return "", ""
+
     # ── CalDAV config routes (backward-compat single-account API) ────────────
 
     @router.get("/config")
@@ -750,6 +774,10 @@ def setup_calendar_routes() -> APIRouter:
                 "username": acc.get("username", "") or "",
                 "has_password": has_pw,
                 "auth_mode": acc.get("auth_mode", "basic"),
+                "oauth_provider": acc.get("oauth_provider", "") or "",
+                "oauth_client_id": acc.get("oauth_client_id", "") or "",
+                "has_oauth_client": bool(acc.get("oauth_client_id") and acc.get("oauth_client_secret")),
+                "connected": bool(acc.get("oauth_refresh_token")),
                 "read_only": bool(acc.get("read_only")),
             })
         return {"accounts": safe}
@@ -763,22 +791,42 @@ def setup_calendar_routes() -> APIRouter:
             body = await request.json()
         except Exception:
             body = {}
-        from src.caldav_sync import validate_caldav_url
-        try:
-            url = validate_caldav_url(body.get("url", ""))
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        if not body.get("password"):
-            raise HTTPException(400, "Password is required")
-        from src.secret_storage import encrypt
-        new_acc = {
-            "id": str(_uuid.uuid4()),
-            "label": (body.get("label") or "").strip() or "CalDAV",
-            "url": url,
-            "username": (body.get("username") or "").strip(),
-            "password": encrypt(body["password"]),
-            "read_only": bool(body.get("read_only")),
-        }
+        if (body.get("auth_mode") or "basic").strip() == "oauth":
+            # OAuth "draft": url/username/tokens are filled by the consent
+            # callback. Optionally carries its own client credentials; blank
+            # falls back to the instance/env client (which must then exist).
+            cid, csec_enc = _resolve_client_creds(body)
+            if not cid and not _os.environ.get("GOOGLE_OAUTH_CLIENT_ID"):
+                raise HTTPException(400, "Provide an OAuth client (client ID + secret, or paste the client JSON), or set GOOGLE_OAUTH_CLIENT_ID in .env")
+            new_acc = {
+                "id": str(_uuid.uuid4()),
+                "label": (body.get("label") or "").strip() or "Google Calendar",
+                "auth_mode": "oauth",
+                "oauth_provider": "google",
+                "oauth_client_id": cid,
+                "oauth_client_secret": csec_enc,
+                "url": "",
+                "username": "",
+                "password": "",
+                "read_only": bool(body.get("read_only", True)),
+            }
+        else:
+            from src.caldav_sync import validate_caldav_url
+            try:
+                url = validate_caldav_url(body.get("url", ""))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            if not body.get("password"):
+                raise HTTPException(400, "Password is required")
+            from src.secret_storage import encrypt
+            new_acc = {
+                "id": str(_uuid.uuid4()),
+                "label": (body.get("label") or "").strip() or "CalDAV",
+                "url": url,
+                "username": (body.get("username") or "").strip(),
+                "password": encrypt(body["password"]),
+                "read_only": bool(body.get("read_only")),
+            }
         accounts = _get_caldav_accounts(owner)
         accounts.append(new_acc)
         _save_caldav_accounts(owner, accounts)
@@ -812,6 +860,11 @@ def setup_calendar_routes() -> APIRouter:
             acc["password"] = encrypt(body["password"])
         if "read_only" in body:
             acc["read_only"] = bool(body["read_only"])
+        if any(k in body for k in ("oauth_client_json", "oauth_client_id", "oauth_client_secret")):
+            # Re-paste / change (or clear) this OAuth account's own client creds.
+            cid, csec_enc = _resolve_client_creds(body)
+            acc["oauth_client_id"] = cid
+            acc["oauth_client_secret"] = csec_enc
         accounts[idx] = acc
         _save_caldav_accounts(owner, accounts)
         return {"ok": True}
@@ -956,17 +1009,27 @@ def setup_calendar_routes() -> APIRouter:
         )
 
     @router.get("/oauth/google/authorize")
-    async def calendar_google_oauth_authorize(request: Request):
+    async def calendar_google_oauth_authorize(request: Request, account_id: str | None = None):
         import urllib.parse
         from fastapi.responses import RedirectResponse
         from routes.email_helpers import make_oauth_state
         owner = _require_user(request)
-        client_id = _os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+        if account_id:
+            # Bring-your-own-client: connect a pre-created OAuth account, using
+            # its own client credentials (falling back to env when unset).
+            from src.caldav_sync import _account_google_client
+            acc = next((a for a in _get_caldav_accounts(owner) if a.get("id") == account_id), None)
+            if acc is None:
+                raise HTTPException(404, "Account not found")
+            client_id, _secret = _account_google_client(acc)
+        else:
+            # One-click connect mints the account id here; the callback creates
+            # the prefs entry under it. The id is bound into the signed state.
+            from src.google_oauth import google_client_credentials
+            account_id = str(uuid.uuid4())
+            client_id, _secret = google_client_credentials()
         if not client_id:
-            raise HTTPException(400, "GOOGLE_OAUTH_CLIENT_ID not set — add it to .env")
-        # One-click connect mints the account id here; the callback creates the
-        # prefs entry under it. The id is bound into the signed state.
-        account_id = str(uuid.uuid4())
+            raise HTTPException(400, "No OAuth client configured — add client credentials to this account or set GOOGLE_OAUTH_CLIENT_ID in .env")
         state = make_oauth_state(account_id, owner)
         params = urllib.parse.urlencode({
             "client_id": client_id,
@@ -990,7 +1053,7 @@ def setup_calendar_routes() -> APIRouter:
         from fastapi.responses import RedirectResponse
         from routes.email_helpers import verify_oauth_state
         from src.secret_storage import encrypt as _enc
-        from src.google_oauth import exchange_authorization_code, google_client_credentials
+        from src.google_oauth import exchange_authorization_code
         import httpx as _httpx
 
         if error:
@@ -1002,7 +1065,11 @@ def setup_calendar_routes() -> APIRouter:
             return RedirectResponse("/?section=integrations&calendar_oauth_error=invalid_state")
         account_id = state_data.get("a", "")
         owner = state_data.get("o", "")
-        client_id, client_secret = google_client_credentials()
+        from src.caldav_sync import _account_google_client
+        accounts = _get_caldav_accounts(owner)
+        idx = next((i for i, a in enumerate(accounts) if a.get("id") == account_id), None)
+        existing = accounts[idx] if idx is not None else None
+        client_id, client_secret = _account_google_client(existing or {})
         try:
             data = exchange_authorization_code(
                 client_id, client_secret, code, _calendar_redirect_uri(request))
@@ -1026,22 +1093,44 @@ def setup_calendar_routes() -> APIRouter:
         if not email:
             return RedirectResponse("/?section=integrations&calendar_oauth_error=userinfo_failed")
 
-        accounts = _get_caldav_accounts(owner)
-        accounts.append({
-            "id": account_id,
-            "label": email,
-            "auth_mode": "oauth",
-            "oauth_provider": "google",
-            "url": f"https://apidata.googleusercontent.com/caldav/v2/{email}/user",
-            "username": email,
-            "password": "",
-            "oauth_access_token": _enc(access_token),
-            "oauth_refresh_token": _enc(refresh_token) if refresh_token else "",
-            "oauth_token_expiry": expiry,
-            # Write-back to Google CalDAV is unproven; start pull-only. The user
-            # can untick read-only in the account settings.
-            "read_only": True,
-        })
+        url = f"https://apidata.googleusercontent.com/caldav/v2/{email}/user"
+        enc_refresh = (
+            _enc(refresh_token) if refresh_token
+            else (existing.get("oauth_refresh_token", "") if existing else "")
+        )
+        if existing is not None:
+            # Bring-your-own-client draft → fill tokens/url in place, preserving
+            # the user's label, read-only choice, and client credentials.
+            acc = dict(existing)
+            acc.update({
+                "auth_mode": "oauth",
+                "oauth_provider": "google",
+                "url": url,
+                "username": email,
+                "password": "",
+                "oauth_access_token": _enc(access_token),
+                "oauth_refresh_token": enc_refresh,
+                "oauth_token_expiry": expiry,
+            })
+            if not acc.get("label"):
+                acc["label"] = email
+            accounts[idx] = acc
+        else:
+            accounts.append({
+                "id": account_id,
+                "label": email,
+                "auth_mode": "oauth",
+                "oauth_provider": "google",
+                "url": url,
+                "username": email,
+                "password": "",
+                "oauth_access_token": _enc(access_token),
+                "oauth_refresh_token": enc_refresh,
+                "oauth_token_expiry": expiry,
+                # Write-back to Google CalDAV is unproven; start pull-only. The
+                # user can untick read-only in the account settings.
+                "read_only": True,
+            })
         _save_caldav_accounts(owner, accounts)
         return RedirectResponse("/?section=integrations&calendar_oauth_success=1")
 
