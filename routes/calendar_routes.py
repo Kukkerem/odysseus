@@ -102,6 +102,24 @@ def _get_or_404_event(db, uid: str, owner: str) -> CalendarEvent:
         raise HTTPException(404, "Event not found")
     return ev
 
+def _calendar_is_read_only(owner: str, cal) -> bool:
+    """True when *cal* belongs to a CalDAV account flagged read-only.
+
+    Read-only calendars are remote-authoritative: local edits must be rejected
+    at the source. Otherwise the row diverges locally and — since the write-back
+    is skipped — can never be reconciled back from the server, stranding the
+    event (the move-it-and-it-vanishes bug).
+    """
+    if not (cal and getattr(cal, "source", None) == "caldav"):
+        return False
+    account_id = getattr(cal, "account_id", None)
+    if not account_id:
+        return False
+    from src.caldav_sync import _load_caldav_accounts
+    acc = next((a for a in _load_caldav_accounts(owner)
+                if a.get("id") == account_id), None)
+    return bool(acc and acc.get("read_only"))
+
 
 def _ics_escape(text: str) -> str:
     """Escape a value for an iCalendar TEXT field (RFC 5545 §3.3.11).
@@ -1144,8 +1162,11 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
         try:
             _ensure_default_calendar(db, owner)
             cals = db.query(CalendarCal).filter(CalendarCal.owner == owner).all()
+            from src.caldav_sync import _load_caldav_accounts
+            ro_ids = {a.get("id") for a in _load_caldav_accounts(owner) if a.get("read_only")}
             return {"calendars": [
-                {"name": c.name, "href": c.id, "color": c.color, "source": c.source}
+                {"name": c.name, "href": c.id, "color": c.color, "source": c.source,
+                 "read_only": bool(c.account_id and c.account_id in ro_ids)}
                 for c in cals
             ]}
         except HTTPException:
@@ -1240,6 +1261,8 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                     raise HTTPException(404, "Calendar not found")
             if not cal:
                 cal = _ensure_default_calendar(db, owner)
+            if _calendar_is_read_only(owner, cal):
+                raise HTTPException(403, "Calendar is read-only")
 
             uid = str(uuid.uuid4())
             # Use the tz-detecting parser so events posted with an offset
@@ -1295,6 +1318,8 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
         db = SessionLocal()
         try:
             ev = _get_or_404_event(db, base_uid, owner)
+            if _calendar_is_read_only(owner, ev.calendar):
+                raise HTTPException(403, "Calendar is read-only")
             if data.summary is not None:
                 ev.summary = data.summary
             if data.description is not None:
@@ -1346,6 +1371,8 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
         db = SessionLocal()
         try:
             ev = _get_or_404_event(db, base_uid, owner)
+            if _calendar_is_read_only(owner, ev.calendar):
+                raise HTTPException(403, "Calendar is read-only")
             is_occurrence_delete = scope in {"occurrence", "instance"} and "::" in uid and bool(ev.rrule)
             is_caldav = ev.calendar and ev.calendar.source == "caldav"
             if is_occurrence_delete:

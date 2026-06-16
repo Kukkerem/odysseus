@@ -359,7 +359,8 @@ def _should_prune_window(seen_uids: set, parse_failed: bool) -> bool:
 
 
 def _sync_blocking(owner: str, url: str, username: str, password: str,
-                   account_id: str = "", access_token: str | None = None) -> dict:
+                   account_id: str = "", access_token: str | None = None,
+                   read_only: bool = False) -> dict:
     """The actual sync — synchronous, intended to run in a threadpool.
     Returns counts: {calendars, events, deleted, skipped, errors}."""
     # Lazy imports so a missing `caldav` dep doesn't break app startup —
@@ -530,7 +531,11 @@ def _sync_blocking(owner: str, url: str, username: str, password: str,
 
                             existing = _find_existing_event(db, pending, uid_val, local_cal.id)
                             if existing:
-                                if existing.caldav_sync_pending in {"create", "update"}:
+                                # Read-only calendars are remote-authoritative: a
+                                # local edit can never be pushed, so honouring its
+                                # pending flag would strand the divergence forever.
+                                # Overwrite from the server and clear the flag.
+                                if existing.caldav_sync_pending in {"create", "update"} and not read_only:
                                     result["events"] += 1
                                     continue
                                 existing.calendar_id = local_cal.id
@@ -596,7 +601,9 @@ def _sync_blocking(owner: str, url: str, username: str, password: str,
                             CalendarEvent.dtstart >= start,
                             CalendarEvent.dtstart <= end,
                             CalendarEvent.remote_href.isnot(None),
-                            CalendarEvent.caldav_sync_pending.is_(None),
+                            # Read-only: prune diverged local rows too (incl. ones
+                            # an edit moved out of the window) — server wins.
+                            *([] if read_only else [CalendarEvent.caldav_sync_pending.is_(None)]),
                             ~CalendarEvent.uid.in_(seen_uids) if seen_uids else CalendarEvent.uid.isnot(None),
                         ).all()
                         for ev in stale:
@@ -839,7 +846,8 @@ async def sync_caldav(owner: str) -> dict:
         try:
             url = validate_caldav_url(url)
             result = await asyncio.to_thread(
-                _sync_blocking, owner, url, user, pw, account_id, access_token)
+                _sync_blocking, owner, url, user, pw, account_id, access_token,
+                bool(acc.get("read_only")))
         except ValueError as e:
             result = {"calendars": 0, "events": 0, "deleted": 0, "errors": [str(e)]}
         except Exception as e:
