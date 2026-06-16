@@ -732,6 +732,7 @@ def setup_calendar_routes() -> APIRouter:
                 "username": acc.get("username", "") or "",
                 "has_password": has_pw,
                 "auth_mode": acc.get("auth_mode", "basic"),
+                "read_only": bool(acc.get("read_only")),
             })
         return {"accounts": safe}
 
@@ -758,6 +759,7 @@ def setup_calendar_routes() -> APIRouter:
             "url": url,
             "username": (body.get("username") or "").strip(),
             "password": encrypt(body["password"]),
+            "read_only": bool(body.get("read_only")),
         }
         accounts = _get_caldav_accounts(owner)
         accounts.append(new_acc)
@@ -790,6 +792,8 @@ def setup_calendar_routes() -> APIRouter:
         if body.get("password"):
             from src.secret_storage import encrypt
             acc["password"] = encrypt(body["password"])
+        if "read_only" in body:
+            acc["read_only"] = bool(body["read_only"])
         accounts[idx] = acc
         _save_caldav_accounts(owner, accounts)
         return {"ok": True}
@@ -1016,6 +1020,9 @@ def setup_calendar_routes() -> APIRouter:
             "oauth_access_token": _enc(access_token),
             "oauth_refresh_token": _enc(refresh_token) if refresh_token else "",
             "oauth_token_expiry": expiry,
+            # Write-back to Google CalDAV is unproven; start pull-only. The user
+            # can untick read-only in the account settings.
+            "read_only": True,
         })
         _save_caldav_accounts(owner, accounts)
         return RedirectResponse("/?section=integrations&calendar_oauth_success=1")
