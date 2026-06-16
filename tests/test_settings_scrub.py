@@ -100,6 +100,8 @@ def test_scrub_blanks_caldav_oauth_tokens_keeps_label():
     and the (non-secret) expiry timestamp."""
     out = scrub_settings({"caldav_accounts": [{
         "id": "a1", "label": "Work", "username": "me@x.com",
+        "oauth_client_id": "c-id.apps.googleusercontent.com",
+        "oauth_client_secret": "GOCSPX-secret",
         "oauth_access_token": "ya29.secret",
         "oauth_refresh_token": "1//secret",
         "oauth_token_expiry": "1750000000",
@@ -107,6 +109,8 @@ def test_scrub_blanks_caldav_oauth_tokens_keeps_label():
     acc = out["caldav_accounts"][0]
     assert acc["oauth_access_token"] == ""
     assert acc["oauth_refresh_token"] == ""
+    assert acc["oauth_client_secret"] == ""              # per-account client secret blanked
+    assert acc["oauth_client_id"] == "c-id.apps.googleusercontent.com"  # client id is public
     assert acc["label"] == "Work"          # non-secret preserved
     assert acc["username"] == "me@x.com"
     assert acc["oauth_token_expiry"] == "1750000000"  # not secret-shaped

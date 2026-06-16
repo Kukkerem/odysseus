@@ -9,6 +9,7 @@ imports) so src/caldav_sync.py can import it without a circular dependency.
 """
 from __future__ import annotations
 
+import json
 import os
 
 import httpx
@@ -22,6 +23,28 @@ def google_client_credentials() -> tuple[str, str]:
         os.environ.get("GOOGLE_OAUTH_CLIENT_ID", ""),
         os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", ""),
     )
+
+
+def parse_client_json(text: str) -> tuple[str, str]:
+    """Extract (client_id, client_secret) from Google's downloaded
+    ``client_secret_*.json``. Accepts the ``web`` / ``installed`` wrapper
+    shapes and a flat ``{"client_id", "client_secret"}`` object.
+    Raises ValueError when the input is not valid JSON or either field is
+    missing."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError) as e:
+        raise ValueError("not valid JSON") from e
+    if not isinstance(data, dict):
+        raise ValueError("expected a JSON object")
+    inner = data.get("web") or data.get("installed") or data
+    if not isinstance(inner, dict):
+        raise ValueError("unexpected client JSON shape")
+    client_id = (inner.get("client_id") or "").strip()
+    client_secret = (inner.get("client_secret") or "").strip()
+    if not client_id or not client_secret:
+        raise ValueError("missing client_id or client_secret")
+    return client_id, client_secret
 
 
 def exchange_refresh_token(client_id: str, client_secret: str, refresh_token: str,
