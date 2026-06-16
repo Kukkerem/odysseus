@@ -272,6 +272,11 @@ async def writeback_event(owner: str, calendar_source: str, calendar_id: str,
         if acc is None:
             acc = accounts[0]
 
+        # Read-only account: pull-only. Skip every outbound write (create,
+        # update, delete) — all push paths funnel through here.
+        if acc.get("read_only"):
+            return {"skipped": "read-only calendar"}
+
         url = (acc.get("url") or "").strip()
         user = (acc.get("username") or "").strip()
         auth_mode = (acc.get("auth_mode") or "basic").lower()
