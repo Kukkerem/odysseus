@@ -819,10 +819,12 @@ def setup_calendar_routes() -> APIRouter:
         url = (body.get("url") or "").strip()
         user = (body.get("username") or "").strip()
         pw = body.get("password") or ""
+        # Resolve a saved account when inline basic-auth creds aren't supplied.
+        # Needed both to fill url/user/pw and to detect OAuth accounts, which
+        # carry no password and authenticate with a bearer token.
+        acc = None
         if not (url and user and pw):
-            # Look up a saved account: by id if supplied, else first account.
             accounts = _get_caldav_accounts(owner)
-            acc = None
             if body.get("account_id"):
                 acc = next((a for a in accounts if a.get("id") == body["account_id"]), None)
             if acc is None and accounts:
@@ -830,52 +832,77 @@ def setup_calendar_routes() -> APIRouter:
             if acc:
                 url = url or (acc.get("url") or "")
                 user = user or (acc.get("username") or "")
-                if not pw:
-                    pw = acc.get("password") or ""
-                    if pw:
-                        try:
-                            from src.secret_storage import decrypt
-                            pw = decrypt(pw)
-                        except Exception:
-                            pass
-        if not (url and user and pw):
-            return {"ok": False, "error": "Missing URL, username, or password"}
         from src.caldav_sync import validate_caldav_url
+        access_token = None
+        if acc and (acc.get("auth_mode") or "").lower() == "oauth":
+            # OAuth account: probe with a bearer token instead of a password.
+            from src.caldav_sync import _resolve_google_caldav_token, _google_caldav_events_url
+            access_token = _resolve_google_caldav_token(owner, acc)
+            if not access_token:
+                return {"ok": False, "error": "Google authorization expired — reconnect Google Calendar"}
+            if not (url and user):
+                return {"ok": False, "error": "Missing URL or account email"}
+        else:
+            # Basic/Digest account: a password is required.
+            if not pw and acc:
+                pw = acc.get("password") or ""
+                if pw:
+                    try:
+                        from src.secret_storage import decrypt
+                        pw = decrypt(pw)
+                    except Exception:
+                        pass
+            if not (url and user and pw):
+                return {"ok": False, "error": "Missing URL, username, or password"}
         try:
             url = validate_caldav_url(url)
         except ValueError as e:
             return {"ok": False, "error": str(e)}
+        if access_token:
+            # Google's …/user principal holds no VEVENTs — probe the event
+            # collection the real sync targets (see _google_caldav_events_url).
+            url = _google_caldav_events_url(url) or url
         import httpx
         propfind_body = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/>'
             '</d:prop></d:propfind>'
         )
+        headers = {"Depth": "0", "Content-Type": "application/xml"}
         try:
             async with httpx.AsyncClient(timeout=8.0, follow_redirects=False, trust_env=False) as cx:
-                r = await cx.request(
-                    "PROPFIND", url,
-                    auth=(user, pw),
-                    headers={"Depth": "0", "Content-Type": "application/xml"},
-                    content=propfind_body,
-                )
-                # If the server demands Digest (Baïkal default, SabreDAV-based
-                # servers, Radicale with htdigest), the Basic attempt above
-                # 401s. Retry once with httpx.DigestAuth so this test matches
-                # what the real sync does via caldav.DAVClient in
-                # src/caldav_sync.py (which negotiates the scheme).
-                if r.status_code == 401 and "digest" in r.headers.get("www-authenticate", "").lower():
+                if access_token:
                     r = await cx.request(
                         "PROPFIND", url,
-                        auth=httpx.DigestAuth(user, pw),
-                        headers={"Depth": "0", "Content-Type": "application/xml"},
+                        headers={**headers, "Authorization": f"Bearer {access_token}"},
                         content=propfind_body,
                     )
+                else:
+                    r = await cx.request(
+                        "PROPFIND", url,
+                        auth=(user, pw),
+                        headers=headers,
+                        content=propfind_body,
+                    )
+                    # If the server demands Digest (Baïkal default, SabreDAV-based
+                    # servers, Radicale with htdigest), the Basic attempt above
+                    # 401s. Retry once with httpx.DigestAuth so this test matches
+                    # what the real sync does via caldav.DAVClient in
+                    # src/caldav_sync.py (which negotiates the scheme).
+                    if r.status_code == 401 and "digest" in r.headers.get("www-authenticate", "").lower():
+                        r = await cx.request(
+                            "PROPFIND", url,
+                            auth=httpx.DigestAuth(user, pw),
+                            headers=headers,
+                            content=propfind_body,
+                        )
             # 207 = Multi-Status — standard CalDAV success. 200 also
             # acceptable. Anything else (401/403/404/5xx) means trouble.
             if r.status_code in (200, 207):
                 return {"ok": True}
             if r.status_code == 401:
+                if access_token:
+                    return {"ok": False, "error": "Google authorization expired — reconnect Google Calendar"}
                 return {"ok": False, "error": "Auth failed — check username/password"}
             if r.status_code == 403:
                 return {"ok": False, "error": "Forbidden — user can't access that URL"}
