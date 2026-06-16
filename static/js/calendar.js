@@ -429,6 +429,19 @@ function _todayCount() {
   }).length;
 }
 
+// True when a calendar (by href) is a read-only CalDAV calendar. The server
+// rejects edits to it (remote is authoritative), so the UI must not offer
+// move/edit/delete affordances that would only bounce back via the 403 path.
+function _calIsReadOnly(href) {
+  const cal = _calendars.find(c => c.href === href);
+  return !!(cal && cal.read_only);
+}
+function _evReadOnly(ev) {
+  return ev ? _calIsReadOnly(ev.calendar_href) : false;
+}
+
+const _lockIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
+
 // Per-event ⋮ menu: Remind me / Delete
 function _wireQuickDelete(body) {
   body.querySelectorAll('.cal-event-more').forEach(btn => {
@@ -482,18 +495,27 @@ function _showEventMoreMenu(ev, anchor) {
 
   const _editIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
 
-  dropdown.appendChild(_item(_editIcon, 'Edit', () => {
-    closeMenu();
-    _showEventForm(ev);
-  }));
+  if (_evReadOnly(ev)) {
+    // Remote-authoritative calendar: surface the state instead of edit actions.
+    const note = document.createElement('div');
+    note.className = 'dropdown-item-compact';
+    note.style.cssText = 'opacity:0.65;cursor:default;';
+    note.innerHTML = `<span class="dropdown-icon">${_lockIcon}</span><span>Read-only calendar</span>`;
+    dropdown.appendChild(note);
+  } else {
+    dropdown.appendChild(_item(_editIcon, 'Edit', () => {
+      closeMenu();
+      _showEventForm(ev);
+    }));
 
-  dropdown.appendChild(_item(_trashIcon, 'Delete', async () => {
-    closeMenu();
-    const name = ev.summary ? `"${ev.summary}"` : 'this event';
-    const ok = await uiModule.styledConfirm(`Delete ${name}?`, { confirmText: 'Delete', danger: true });
-    if (!ok) return;
-    try { await _deleteEvent(ev.uid); setTimeout(() => _render(), 100); } catch (_) {}
-  }, true));
+    dropdown.appendChild(_item(_trashIcon, 'Delete', async () => {
+      closeMenu();
+      const name = ev.summary ? `"${ev.summary}"` : 'this event';
+      const ok = await uiModule.styledConfirm(`Delete ${name}?`, { confirmText: 'Delete', danger: true });
+      if (!ok) return;
+      try { await _deleteEvent(ev.uid); setTimeout(() => _render(), 100); } catch (_) {}
+    }, true));
+  }
 
   document.body.appendChild(dropdown);
   dropdown._anchorRect = rect;
@@ -1308,6 +1330,7 @@ async function _renderWeek() {
       const uid = block.dataset.uid;
       const ev = _events.find(x => x.uid === uid);
       if (!ev) return;
+      if (_evReadOnly(ev)) return;  // read-only: no move gesture
       const cols = Array.from(body.querySelectorAll('.cal-wk-grid'));
       if (!cols.length) return;
       // Local/display timing
@@ -1438,6 +1461,7 @@ async function _renderWeek() {
       const uid = block.dataset.uid;
       const ev = _events.find(x => x.uid === uid);
       if (!ev || !grid || !ds) return;
+      if (_evReadOnly(ev)) return;  // read-only: no resize gesture
       const startMin = _timeToMin(ev.dtstart) ?? 0;
       const initialTop = parseFloat(block.style.top || '0');
       const gridRect = grid.getBoundingClientRect();
@@ -2341,6 +2365,11 @@ function _wireAll(body) {
   // Drag
   body.querySelectorAll('[draggable="true"][data-uid]').forEach(el => {
     el.addEventListener('dragstart', (e) => {
+      if (_evReadOnly(_allEvents[el.dataset.uid])) {
+        e.preventDefault();
+        uiModule.showToast?.('Read-only calendar — event can’t be moved');
+        return;
+      }
       _dragUid = el.dataset.uid;
       e.dataTransfer.effectAllowed = 'move';
       el.classList.add('cal-dragging');
@@ -3066,6 +3095,16 @@ function _showEventForm(existing, defaultDate, defaultEndDate) {
   document.getElementById('cal-f-cancel')?.addEventListener('click', _cancelEventForm);
   document.getElementById('cal-form-mobile-cancel')?.addEventListener('click', _cancelEventForm);
   document.getElementById('cal-f-save')?.addEventListener('click', async () => {
+    // Read-only guard: a read-only CalDAV calendar rejects writes server-side
+    // (remote is authoritative). Stop with a clear message instead of letting
+    // the change bounce back via the 403 + optimistic-rollback path.
+    const _tgtHref = isEdit ? (existing && existing.calendar_href)
+                            : (document.getElementById('cal-f-cal')?.value || _calendars[0]?.href || '');
+    if (_calIsReadOnly(_tgtHref)) {
+      uiModule.showError ? uiModule.showError('This calendar is read-only — changes are not saved.')
+                         : uiModule.showToast('Calendar is read-only');
+      return;
+    }
     const summary = document.getElementById('cal-f-sum').value.trim();
     if (!summary) { uiModule.showToast('Title required'); return; }
     const dv = document.getElementById('cal-f-date').value;

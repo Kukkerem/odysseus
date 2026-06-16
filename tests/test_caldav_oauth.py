@@ -108,9 +108,11 @@ def test_sync_caldav_oauth_resolves_token_and_passes_it(monkeypatch):
     monkeypatch.setattr(caldav_sync, "_resolve_google_caldav_token", lambda o, a: "ya29.live")
     seen = {}
 
-    def _fake_blocking(owner, url, username, password, account_id="", access_token=None):
+    def _fake_blocking(owner, url, username, password, account_id="",
+                       access_token=None, read_only=False):
         seen.update(url=url, username=username, password=password,
-                    account_id=account_id, access_token=access_token)
+                    account_id=account_id, access_token=access_token,
+                    read_only=read_only)
         return {"calendars": 1, "events": 3, "deleted": 0, "errors": []}
 
     monkeypatch.setattr(caldav_sync, "_sync_blocking", _fake_blocking)
@@ -118,6 +120,7 @@ def test_sync_caldav_oauth_resolves_token_and_passes_it(monkeypatch):
     assert out["events"] == 3
     assert seen["access_token"] == "ya29.live"
     assert seen["password"] == ""  # OAuth carries no password
+    assert seen["read_only"] is False  # acc carries no read_only -> writable
 
 
 def test_sync_caldav_oauth_unresolvable_token_surfaces_reconnect(monkeypatch):
