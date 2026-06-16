@@ -327,7 +327,12 @@ primary calendar never syncs and reads return `404 No events found` (the v2
 CalDAV endpoint requires OAuth). To connect such an account, in the **same
 Google Cloud project** you use for Gmail OAuth:
 
-1. Enable the **Google Calendar API**.
+1. Enable **both** the **Google Calendar API** and the **CalDAV API** — they are
+   separate APIs. The CalDAV endpoint returns `403 Forbidden`
+   (`accessNotConfigured: CalDAV API has not been used in project …`) until the
+   **CalDAV API** is enabled, even when the Calendar API already is. "Test
+   Connection" failing with *Forbidden* after connecting almost always means the
+   CalDAV API is still disabled.
 2. On the OAuth consent screen, add the `https://www.googleapis.com/auth/calendar`
    scope (read-write calendar) alongside the existing email scope.
 3. Register the redirect URI `<base>/api/calendar/oauth/google/callback`
