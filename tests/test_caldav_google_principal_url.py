@@ -83,6 +83,7 @@ class _FakePrincipal:
 class _FakeClient:
     def __init__(self, url=None, username=None, password=None):
         self.url = url
+        self.headers = {}
         # Mirror the real DAVClient: _build_dav_client sets
         # session.max_redirects = 0 right after construction.
         self.session = types.SimpleNamespace(max_redirects=30)
@@ -92,6 +93,23 @@ class _FakeClient:
 
     def calendar(self, url=None):
         return _FakeCalendar(url)
+
+    def request(self, url, method="GET", body="", headers=None):
+        # OAuth Google sync issues a calendar-query REPORT and expects a 207
+        # multistatus with calendar-data inline (see _google_report_events).
+        # A non-/events target gets Google's empty-window "404 No events found."
+        if method == "REPORT" and str(url).rstrip("/").endswith("/events"):
+            xml = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<D:multistatus xmlns:D="DAV:" xmlns:caldav="urn:ietf:params:xml:ns:caldav">'
+                '<D:response><D:href>/caldav/v2/me%40gmail.com/events/x</D:href>'
+                '<D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop>'
+                '<D:getetag>"1"</D:getetag>'
+                '<caldav:calendar-data>' + _ics_one_event() + '</caldav:calendar-data>'
+                '</D:prop></D:propstat></D:response></D:multistatus>'
+            )
+            return types.SimpleNamespace(status=207, raw=xml)
+        return types.SimpleNamespace(status=404, raw="No events found.")
 
 
 def _install_fake_caldav(monkeypatch):
@@ -154,6 +172,50 @@ def test_google_sync_pulls_events_instead_of_empty(monkeypatch):
 
     # The fix routes discovery-less Google sync to the /events collection, so
     # the VEVENT is pulled. Pre-fix this queried /user and returned 0 events.
+    assert result["events"] == 1, result
+    assert not result["errors"], result["errors"]
+
+    db = _TS()
+    try:
+        ev = db.query(CalendarEvent).filter(CalendarEvent.uid == "evt-1@google").first()
+        assert ev is not None and ev.summary == "Standup"
+    finally:
+        db.close()
+
+
+def test_google_report_events_parses_inline_calendar_data():
+    from icalendar import Calendar as iCal
+    client = _FakeClient()
+    start = datetime.utcnow() - timedelta(days=1)
+    end = datetime.utcnow() + timedelta(days=30)
+    objs = caldav_sync._google_report_events(client, _GOOGLE_EVENTS, start, end)
+    assert len(objs) == 1
+    ical = iCal.from_ical(objs[0].data)
+    assert any(c.name == "VEVENT" and str(c.get("summary")) == "Standup"
+               for c in ical.walk())
+
+
+def test_google_report_events_empty_window_returns_empty():
+    # Google answers an empty window with a plain-text "404 No events found.";
+    # that must be zero events, never an error. The fake returns 404 for any
+    # non-/events target.
+    client = _FakeClient()
+    objs = caldav_sync._google_report_events(
+        client, _GOOGLE_PRINCIPAL, datetime.utcnow(),
+        datetime.utcnow() + timedelta(days=1))
+    assert objs == []
+
+
+def test_oauth_google_sync_uses_report_and_pulls_events(monkeypatch):
+    # OAuth Google sync must bypass the caldav library's broken search() and
+    # pull events through the direct REPORT path.
+    _install_fake_caldav(monkeypatch)
+    _clear_db()
+
+    result = caldav_sync._sync_blocking(
+        "alice", _GOOGLE_PRINCIPAL, "me@gmail.com", "",
+        account_id="acc-o", access_token="ya29.live")
+
     assert result["events"] == 1, result
     assert not result["errors"], result["errors"]
 
