@@ -235,3 +235,44 @@ def test_writeback_rejects_unsafe_saved_url_before_remote_call(monkeypatch):
 
     assert result == {"ok": False, "error": "CalDAV URL host is not allowed"}
     assert called is False
+
+def test_writeback_skips_read_only_account_before_remote_call(monkeypatch):
+    import src.caldav_sync as sync
+    import src.caldav_writeback as wb
+
+    prefs_mod = types.ModuleType("routes.prefs_routes")
+    prefs_mod._load_for_user = lambda owner: {
+        "caldav_accounts": [{
+            "id": "acc-ro",
+            "url": "https://dav.example.com/calendars/home/",
+            "username": owner,
+            "password": "enc:pw",
+            "read_only": True,
+        }]
+    }
+    secret_mod = types.ModuleType("src.secret_storage")
+    secret_mod.decrypt = lambda value: "plain-password"
+    monkeypatch.setitem(sys.modules, "routes.prefs_routes", prefs_mod)
+    monkeypatch.setitem(sys.modules, "src.secret_storage", secret_mod)
+
+    called = False
+
+    def fake_writeback_blocking(*a, **k):
+        nonlocal called
+        called = True
+        return {"ok": True}
+
+    async def inline_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(sync, "validate_caldav_url", lambda u: u)
+    monkeypatch.setattr(wb, "_writeback_blocking", fake_writeback_blocking)
+    monkeypatch.setattr(wb.asyncio, "to_thread", inline_to_thread)
+
+    result = asyncio.run(
+        wb.writeback_event("alice", "caldav", "caldav-123", {"uid": "evt-1"})
+    )
+
+    # Read-only short-circuits before any credential/URL/remote work.
+    assert result == {"skipped": "read-only calendar"}
+    assert called is False

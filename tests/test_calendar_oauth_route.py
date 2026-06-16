@@ -68,6 +68,7 @@ async def test_callback_valid_state_creates_oauth_account_with_encrypted_tokens(
     assert _dec(acc["oauth_access_token"]) == "ya29.A"
     assert _dec(acc["oauth_refresh_token"]) == "1//R"
     assert "ya29" not in acc["oauth_token_expiry"]
+    assert acc["read_only"] is True  # Google OAuth accounts default to read-only
 
 
 @pytest.mark.asyncio
@@ -110,7 +111,8 @@ async def test_account_list_exposes_auth_mode_never_tokens(monkeypatch):
     resp = await list_accounts(request=_FakeRequest())
     a = resp["accounts"][0]
     assert a["auth_mode"] == "oauth"
-    assert set(a.keys()) == {"id", "label", "url", "username", "has_password", "auth_mode"}
+    assert set(a.keys()) == {"id", "label", "url", "username", "has_password", "auth_mode", "read_only"}
+    assert a["read_only"] is False
 
 class _BodyRequest:
     headers = {"host": "localhost:7000"}
@@ -202,3 +204,28 @@ async def test_test_connection_oauth_expired_token_says_reconnect(monkeypatch):
 
     assert resp["ok"] is False
     assert "reconnect Google Calendar" in resp["error"]
+
+
+@pytest.mark.asyncio
+async def test_add_and_update_round_trip_read_only(monkeypatch):
+    """read_only is persisted by add, surfaced by list, and toggled by PUT."""
+    store = {}
+    monkeypatch.setattr("routes.calendar_routes._require_user", lambda req: "alice", raising=False)
+    monkeypatch.setattr("routes.prefs_routes._load_for_user", lambda o=None: dict(store.get(o, {})))
+    monkeypatch.setattr("routes.prefs_routes._save_for_user", lambda o, p: store.__setitem__(o, p))
+    monkeypatch.setattr("src.caldav_sync.validate_caldav_url", lambda u: u)
+
+    add = _route("/api/calendar/config/accounts", "POST")
+    created = await add(request=_BodyRequest({
+        "label": "Work", "url": "https://dav.example.com/u/",
+        "username": "me", "password": "pw", "read_only": True}))
+    acc_id = created["id"]
+
+    lst = _route("/api/calendar/config/accounts", "GET")
+    accounts = (await lst(request=_BodyRequest({})))["accounts"]
+    assert accounts[0]["read_only"] is True
+
+    upd = _route("/api/calendar/config/accounts/{account_id}", "PUT")
+    await upd(account_id=acc_id, request=_BodyRequest({"read_only": False}))
+    accounts = (await lst(request=_BodyRequest({})))["accounts"]
+    assert accounts[0]["read_only"] is False
