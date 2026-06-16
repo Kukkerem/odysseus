@@ -111,3 +111,94 @@ async def test_account_list_exposes_auth_mode_never_tokens(monkeypatch):
     a = resp["accounts"][0]
     assert a["auth_mode"] == "oauth"
     assert set(a.keys()) == {"id", "label", "url", "username", "has_password", "auth_mode"}
+
+class _BodyRequest:
+    headers = {"host": "localhost:7000"}
+
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+def _oauth_acc():
+    from src.secret_storage import encrypt as _enc
+    return {
+        "id": "acc-o", "label": "Work", "auth_mode": "oauth", "oauth_provider": "google",
+        "url": "https://apidata.googleusercontent.com/caldav/v2/me@x.com/user",
+        "username": "me@x.com", "password": "",
+        "oauth_access_token": _enc("ya29.x"), "oauth_refresh_token": _enc("1//x"),
+        "oauth_token_expiry": "9999999999",
+    }
+
+
+@pytest.mark.asyncio
+async def test_test_connection_oauth_probes_events_url_with_bearer(monkeypatch):
+    """Test Connection on an OAuth account (no password) must resolve a bearer
+    token and PROPFIND the /events collection — not fail the old
+    url+user+pw guard, and never send basic-auth creds."""
+    monkeypatch.setattr("routes.calendar_routes._require_user", lambda req: "alice", raising=False)
+    monkeypatch.setattr("routes.prefs_routes._load_for_user",
+                        lambda o=None: {"caldav_accounts": [_oauth_acc()]})
+    monkeypatch.setattr("src.caldav_sync.validate_caldav_url", lambda u: u)
+    monkeypatch.setattr("src.caldav_sync._resolve_google_caldav_token",
+                        lambda owner, acc: "ya29.live")
+
+    captured = {}
+
+    class _Resp:
+        def __init__(self, status):
+            self.status_code = status
+            self.headers = {}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            captured["method"] = method
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return _Resp(207)
+
+    monkeypatch.setattr("httpx.AsyncClient", _Client)
+
+    test_conn = _route("/api/calendar/test", "POST")
+    resp = await test_conn(request=_BodyRequest({"account_id": "acc-o"}))
+
+    assert resp == {"ok": True}
+    assert captured["method"] == "PROPFIND"
+    assert captured["url"] == "https://apidata.googleusercontent.com/caldav/v2/me@x.com/events"
+    assert captured["kwargs"]["headers"]["Authorization"] == "Bearer ya29.live"
+    assert "auth" not in captured["kwargs"]
+
+
+@pytest.mark.asyncio
+async def test_test_connection_oauth_expired_token_says_reconnect(monkeypatch):
+    """When the token can't be resolved/refreshed, /test reports a reconnect
+    hint and never touches the network."""
+    monkeypatch.setattr("routes.calendar_routes._require_user", lambda req: "alice", raising=False)
+    monkeypatch.setattr("routes.prefs_routes._load_for_user",
+                        lambda o=None: {"caldav_accounts": [_oauth_acc()]})
+    monkeypatch.setattr("src.caldav_sync.validate_caldav_url", lambda u: u)
+    monkeypatch.setattr("src.caldav_sync._resolve_google_caldav_token",
+                        lambda owner, acc: None)
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise AssertionError("no network when the token is unresolvable")
+
+    monkeypatch.setattr("httpx.AsyncClient", _Boom)
+
+    test_conn = _route("/api/calendar/test", "POST")
+    resp = await test_conn(request=_BodyRequest({"account_id": "acc-o"}))
+
+    assert resp["ok"] is False
+    assert "reconnect Google Calendar" in resp["error"]
