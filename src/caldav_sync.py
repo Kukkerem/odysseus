@@ -863,22 +863,36 @@ def _load_caldav_accounts(owner: str) -> list:
 _TOKEN_EXPIRY_SKEW_SECONDS = 60
 
 
+def _account_google_client(account: dict) -> tuple[str, str]:
+    """Resolve the Google OAuth client (id, secret) for a CalDAV account: the
+    account's own credentials when both are configured (secret decrypted), else
+    the instance/env client. Single source of truth for the authorize, callback
+    and refresh paths."""
+    from src.google_oauth import google_client_credentials
+    cid = (account or {}).get("oauth_client_id") or ""
+    enc = (account or {}).get("oauth_client_secret") or ""
+    if cid and enc:
+        from src.secret_storage import decrypt as _dec
+        return cid, (_dec(enc) or "")
+    return google_client_credentials()
+
+
 def _refresh_google_caldav_token(owner: str, account_id: str) -> str | None:
     """Exchange the account's stored refresh token for a new access token and
     persist the encrypted token + expiry back into the owner's prefs entry."""
     from routes.prefs_routes import _load_for_user, _save_for_user
     from src.secret_storage import decrypt as _dec, encrypt as _enc
-    from src.google_oauth import exchange_refresh_token, google_client_credentials
+    from src.google_oauth import exchange_refresh_token
 
-    client_id, client_secret = google_client_credentials()
-    if not (client_id and client_secret):
-        return None
     prefs = _load_for_user(owner) or {}
     accounts = list(prefs.get("caldav_accounts") or [])
     idx = next((i for i, a in enumerate(accounts) if a.get("id") == account_id), None)
     if idx is None:
         return None
     acc = accounts[idx]
+    client_id, client_secret = _account_google_client(acc)
+    if not (client_id and client_secret):
+        return None
     try:
         refresh_token = _dec(acc.get("oauth_refresh_token") or "")
     except Exception:

@@ -236,3 +236,57 @@ def test_non_google_404_keeps_generic_message(monkeypatch):
         "alice", "https://dav.fastmail.com/dav/calendars/user/me/", "me", "pw")
     assert any("date_search failed" in e for e in out["errors"])
     assert not any("Connect Google Calendar" in e for e in out["errors"])
+
+# --- Per-account OAuth client (bring-your-own-client) ---
+from src.google_oauth import parse_client_json
+
+
+def test_parse_client_json_web_installed_and_flat_shapes():
+    assert parse_client_json('{"web":{"client_id":"w-id","client_secret":"w-sec"}}') == ("w-id", "w-sec")
+    assert parse_client_json('{"installed":{"client_id":"i-id","client_secret":"i-sec"}}') == ("i-id", "i-sec")
+    assert parse_client_json('{"client_id":"f-id","client_secret":"f-sec"}') == ("f-id", "f-sec")
+
+
+def test_parse_client_json_missing_field_or_bad_input_raises():
+    with pytest.raises(ValueError):
+        parse_client_json('{"web":{"client_id":"only-id"}}')   # no secret
+    with pytest.raises(ValueError):
+        parse_client_json('not json at all')
+    with pytest.raises(ValueError):
+        parse_client_json('[]')                                # not an object
+
+
+def test_account_google_client_prefers_account_creds(monkeypatch):
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "env-id")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "env-sec")
+    acc = {"oauth_client_id": "acc-id", "oauth_client_secret": _enc("acc-sec")}
+    assert caldav_sync._account_google_client(acc) == ("acc-id", "acc-sec")
+
+
+def test_account_google_client_falls_back_to_env(monkeypatch):
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "env-id")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "env-sec")
+    assert caldav_sync._account_google_client({}) == ("env-id", "env-sec")
+    # a half-configured client (id but no secret) is unusable -> env
+    assert caldav_sync._account_google_client({"oauth_client_id": "x"}) == ("env-id", "env-sec")
+
+
+def test_refresh_uses_per_account_client_not_env(monkeypatch):
+    import time
+    acc = _oauth_account(int(time.time()) - 5)  # expired -> forces refresh
+    acc["oauth_client_id"] = "acc-id"
+    acc["oauth_client_secret"] = _enc("acc-sec")
+    store = {"caldav_accounts": [dict(acc)]}
+    monkeypatch.setattr("routes.prefs_routes._load_for_user", lambda o=None: dict(store))
+    monkeypatch.setattr("routes.prefs_routes._save_for_user", lambda o, p: None)
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "env-id")     # differs — must not be used
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "env-sec")
+    seen = {}
+
+    def _exchange(cid, csec, rtok, *a, **k):
+        seen["cid"], seen["csec"] = cid, csec
+        return {"access_token": "ya29.byo", "expires_in": 3600}
+    monkeypatch.setattr("src.google_oauth.exchange_refresh_token", _exchange)
+
+    assert caldav_sync._refresh_google_caldav_token("alice", "acc-oauth") == "ya29.byo"
+    assert seen == {"cid": "acc-id", "csec": "acc-sec"}
