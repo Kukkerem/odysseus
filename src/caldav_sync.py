@@ -255,6 +255,69 @@ def _open_url_as_calendar(client, url: str):
     return client.calendar(url=target)
 
 
+class _RawCalObj:
+    """Minimal stand-in for a caldav ``CalendarObjectResource``: the sync loop
+    only reads ``.data`` (the raw VCALENDAR text)."""
+    __slots__ = ("data",)
+
+    def __init__(self, data: str):
+        self.data = data
+
+
+def _google_report_events(client, events_url: str, start, end) -> list:
+    """Fetch events from a Google CalDAV ``/events`` collection via a direct
+    calendar-query REPORT.
+
+    The caldav library's ``search``/``date_search`` is unusable against Google:
+    caldav 3.2.x lazy-loads every matched object with a per-href GET that Google
+    answers ``404 No events found.`` (python-caldav #310/#401, vdirsyncer #1007),
+    so the high-level search raises ``NotFoundError`` and the calendar comes back
+    empty. A single calendar-query REPORT that requests ``calendar-data`` inline
+    returns the whole window in one 207 multistatus, which Google serves
+    correctly. Auth (Bearer for OAuth, Basic for legacy) is reused from
+    ``client``.
+
+    Returns a list of objects exposing ``.data`` (raw VCALENDAR). An empty window
+    — Google replies with a plain-text ``404 No events found.`` — yields an empty
+    list, not an error. Non-404 failures raise so the caller records them.
+    """
+    from lxml import etree
+    from caldav.lib.error import NotFoundError
+
+    s = start.strftime("%Y%m%dT%H%M%SZ")
+    e = end.strftime("%Y%m%dT%H%M%SZ")
+    body = (
+        '<?xml version="1.0" encoding="utf-8" ?>'
+        '<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+        '<D:prop><D:getetag/><C:calendar-data/></D:prop>'
+        '<C:filter><C:comp-filter name="VCALENDAR">'
+        '<C:comp-filter name="VEVENT">'
+        f'<C:time-range start="{s}" end="{e}"/>'
+        '</C:comp-filter></C:comp-filter></C:filter>'
+        '</C:calendar-query>'
+    )
+    try:
+        resp = client.request(
+            events_url, "REPORT", body,
+            {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+        )
+    except NotFoundError:
+        return []  # empty window — Google's "No events found." quirk
+    if resp.status == 404:
+        return []
+    if resp.status not in (200, 207):
+        raise RuntimeError(f"Google CalDAV REPORT failed: HTTP {resp.status}")
+    raw = resp.raw
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    if not raw or not raw.lstrip().startswith("<"):
+        return []
+    root = etree.fromstring(raw.encode("utf-8"))
+    ns = {"C": "urn:ietf:params:xml:ns:caldav"}
+    return [_RawCalObj(node.text) for node in root.findall(".//C:calendar-data", ns)
+            if node.text and node.text.strip()]
+
+
 def _build_dav_client(url: str, username: str, password: str, access_token: str | None = None):
     """Construct a CalDAV client with automatic redirects disabled.
 
@@ -391,7 +454,15 @@ def _sync_blocking(owner: str, url: str, username: str, password: str,
                 pending: dict = {}
                 parse_failed = False
                 try:
-                    objs = remote_cal.date_search(start=start, end=end, expand=False)
+                    if access_token and _is_google_host(remote_url):
+                        # OAuth Google: caldav 3.2.x search() lazy-loads each
+                        # object with a per-href GET that Google 404s ("No events
+                        # found."); fetch via a direct REPORT with inline
+                        # calendar-data. Basic-auth Google stays on date_search
+                        # below so its "needs OAuth" diagnostic still fires.
+                        objs = _google_report_events(client, remote_url, start, end)
+                    else:
+                        objs = remote_cal.date_search(start=start, end=end, expand=False)
                 except NotFoundError as e:
                     if access_token is None and _is_google_host(url):
                         result["errors"].append(
