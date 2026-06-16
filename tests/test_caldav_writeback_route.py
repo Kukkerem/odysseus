@@ -21,8 +21,10 @@ from sqlalchemy.pool import NullPool
 import core.database as cdb
 import routes.calendar_routes as croutes
 import src.caldav_sync as csync
-from core.database import CalendarCal
-from routes.calendar_routes import EventCreate
+from core.database import CalendarCal, CalendarDeletedEvent, CalendarEvent
+from datetime import datetime
+from fastapi import HTTPException
+from routes.calendar_routes import EventCreate, EventUpdate
 
 _TMPDB = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _ENGINE = create_engine(
@@ -105,3 +107,85 @@ async def test_delete_on_caldav_calendar_pushes_delete(calls):
     rd = await delete_event(_req(), uid)
     assert rd["ok"] is True
     assert len(calls) == 1 and calls[0]["delete"] is True and calls[0]["uid"] == uid
+
+
+# ── Read-only calendar guards ───────────────────────────────────────────
+# Moving/editing an event in a read-only calendar used to mutate the local
+# row + set caldav_sync_pending; the skipped write-back then left it diverged
+# forever (the server-authoritative pull refuses to overwrite pending rows).
+# The write endpoints must reject the mutation at the source with a 403.
+@pytest.fixture
+def read_only_acc(monkeypatch):
+    monkeypatch.setattr(csync, "_load_caldav_accounts",
+                        lambda owner: [{"id": "acc-ro", "read_only": True}])
+
+
+def _make_ro_cal():
+    cid = "caldav-ro-" + uuid.uuid4().hex[:10]
+    db = _TS()
+    try:
+        db.add(CalendarCal(id=cid, owner="tester", name="RO", source="caldav",
+                           account_id="acc-ro"))
+        db.commit()
+        return cid
+    finally:
+        db.close()
+
+
+def _seed_event(cal_id, uid, summary="Orig"):
+    db = _TS()
+    try:
+        db.add(CalendarEvent(uid=uid, calendar_id=cal_id, summary=summary,
+                             dtstart=datetime(2026, 6, 10, 14, 0, 0),
+                             dtend=datetime(2026, 6, 10, 15, 0, 0),
+                             origin="caldav",
+                             remote_href="https://dav.example.com/x.ics"))
+        db.commit()
+    finally:
+        db.close()
+
+
+async def test_create_on_read_only_calendar_is_rejected(calls, read_only_acc):
+    create_event = _endpoint("POST", "/events")
+    cal_id = _make_ro_cal()
+    with pytest.raises(HTTPException) as exc:
+        await create_event(_req(), EventCreate(
+            summary="blocked", dtstart="2026-06-10T14:00:00Z", calendar_href=cal_id))
+    assert exc.value.status_code == 403
+    assert calls == []  # rejected before any write-back push
+
+
+async def test_update_on_read_only_calendar_rejected_and_unchanged(read_only_acc):
+    update_event = _endpoint("PUT", "/events/{uid}")
+    cal_id = _make_ro_cal()
+    uid = "ro-upd-" + uuid.uuid4().hex[:6]
+    _seed_event(cal_id, uid, summary="Orig")
+    with pytest.raises(HTTPException) as exc:
+        await update_event(_req(), uid,
+                           EventUpdate(summary="Moved", dtstart="2026-06-20T14:00:00Z"))
+    assert exc.value.status_code == 403
+    db = _TS()
+    try:
+        ev = db.query(CalendarEvent).filter(CalendarEvent.uid == uid).first()
+        assert ev.summary == "Orig"            # row never mutated
+        assert ev.caldav_sync_pending is None  # no stuck pending flag
+    finally:
+        db.close()
+
+
+async def test_delete_on_read_only_calendar_rejected_and_kept(read_only_acc):
+    delete_event = _endpoint("DELETE", "/events/{uid}")
+    cal_id = _make_ro_cal()
+    uid = "ro-del-" + uuid.uuid4().hex[:6]
+    _seed_event(cal_id, uid)
+    with pytest.raises(HTTPException) as exc:
+        await delete_event(_req(), uid)
+    assert exc.value.status_code == 403
+    db = _TS()
+    try:
+        assert db.query(CalendarEvent).filter(
+            CalendarEvent.uid == uid).first() is not None
+        assert db.query(CalendarDeletedEvent).filter(
+            CalendarDeletedEvent.uid == uid).first() is None  # no tombstone
+    finally:
+        db.close()
