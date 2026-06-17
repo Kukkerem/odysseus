@@ -21,7 +21,12 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 
 
-from src.tool_security import is_public_blocked_tool, owner_is_admin_or_single_user
+from src.tool_security import (
+    is_public_blocked_tool,
+    owner_is_admin_or_single_user,
+    is_high_risk_tool,
+    highrisk_confirm_enabled,
+)
 from src.tool_policy import ToolPolicy
 from src.constants import MAX_OUTPUT_CHARS, MAX_READ_CHARS, MAX_DIFF_LINES, DATA_DIR
 from src.tool_utils import _truncate, get_mcp_manager
@@ -64,6 +69,21 @@ _SENSITIVE_BASENAMES: set[str] = {
 _SENSITIVE_FILE_PATTERNS: tuple[str, ...] = (
     "authorized_keys", "id_rsa", "id_ed25519", "id_ecdsa",
     "known_hosts",
+    # Odysseus' own credential / session / config stores. These live directly
+    # inside DATA_DIR, which is the agent's default tool root (see
+    # _tool_path_roots), so without this entry read_file/write_file are allowed
+    # to touch them. That is dangerous because the path is model-controlled:
+    #   - sessions.json holds live session tokens; a stolen token replays to
+    #     POST /api/auth/users and creates an admin (full account takeover).
+    #   - auth.json holds password hashes.
+    #   - .app_key is the Fernet key that decrypts every other stored secret.
+    #   - app.db is the application database.
+    #   - settings.json can be used to widen tool_path_extra_roots.
+    # Deny them here so they fail closed regardless of which model is wired in.
+    "auth.json", "sessions.json", ".app_key", "app.db", "settings.json",
+    # vault.json is the (Fernet-encrypted) integration secret store;
+    # integrations.json holds provider configs incl. email/calendar tokens.
+    "vault.json", "integrations.json",
 )
 
 
@@ -157,9 +177,15 @@ def _resolve_tool_path(raw_path: str) -> str:
     if raw_path is None or not str(raw_path).strip():
         raise ValueError("path is required")
     expanded = os.path.expanduser(str(raw_path).strip())
+    # Pre-symlink (lexical) path: abspath/normpath collapses ".." WITHOUT
+    # following symlinks. Checking it as well as the realpath closes the
+    # symlink-strip bypass (issue #2348): on NixOS/home-manager ~/.ssh/config
+    # resolves into /nix/store/... which no longer contains ".ssh", so a
+    # realpath-only check would wave it through.
+    pre_symlink = os.path.abspath(expanded)
     resolved = os.path.realpath(expanded)
 
-    if _is_sensitive_path(resolved):
+    if _is_sensitive_path(pre_symlink) or _is_sensitive_path(resolved):
         raise ValueError(
             f"path '{raw_path}' is inside a sensitive directory "
             f"(e.g. .ssh, .gnupg) or matches a sensitive filename"
@@ -193,8 +219,9 @@ def _resolve_tool_path_in_workspace(workspace: str, raw_path: str) -> str:
     base = os.path.realpath(workspace)
     expanded = os.path.expanduser(str(raw_path).strip())
     candidate = expanded if os.path.isabs(expanded) else os.path.join(base, expanded)
+    pre_symlink = os.path.abspath(candidate)  # lexical; pre-symlink guard (#2348)
     resolved = os.path.realpath(candidate)
-    if _is_sensitive_path(resolved):
+    if _is_sensitive_path(pre_symlink) or _is_sensitive_path(resolved):
         raise ValueError(
             f"path '{raw_path}' is inside a sensitive directory "
             f"(e.g. .ssh, .gnupg) or matches a sensitive filename"
@@ -245,8 +272,11 @@ def vet_workspace(raw: str) -> Optional[str]:
     raw = (raw or "").strip()
     if not raw:
         return None
-    resolved = os.path.realpath(os.path.expanduser(raw))
-    if not os.path.isdir(resolved) or _is_sensitive_path(resolved):
+    expanded = os.path.expanduser(raw)
+    resolved = os.path.realpath(expanded)
+    if (not os.path.isdir(resolved)
+            or _is_sensitive_path(os.path.abspath(expanded))
+            or _is_sensitive_path(resolved)):
         return None
     # Reject filesystem roots: binding / (or a Windows drive/UNC root) as the
     # workspace would make every absolute path "inside" it, collapsing the
@@ -635,6 +665,27 @@ async def _execute_tool_block_impl(
             "exit_code": 1,
         }
         logger.warning("Public tool policy blocked owner=%r tool=%s", owner, tool)
+        return desc, result
+
+    # Optional high-risk confirmation gate. Off by default (upstream behavior
+    # unchanged); enable per-deployment with AGENT_HIGHRISK_REQUIRE_CONFIRM=1.
+    # When on, tools that execute code, write files, send mail, read secrets, or
+    # change privileged config do NOT auto-execute inside the agent loop — this
+    # severs the prompt-injection -> autonomous exfil/RCE chain. The ack must
+    # come from outside the model (a human), so an in-band marker the model
+    # could emit itself is intentionally NOT honored.
+    if highrisk_confirm_enabled() and is_high_risk_tool(tool):
+        desc = f"{tool}: CONFIRMATION REQUIRED"
+        result = {
+            "error": (
+                f"Tool '{tool}' is high-risk and this deployment requires explicit "
+                "human confirmation before it runs. It was NOT executed. Tell the "
+                "user what you intend to do and ask them to run or approve it."
+            ),
+            "exit_code": 1,
+            "needs_confirmation": True,
+        }
+        logger.warning("High-risk tool gated (confirm required) owner=%r tool=%s", owner, tool)
         return desc, result
 
     # ask_user: the agent poses a multiple-choice question to the user to get a

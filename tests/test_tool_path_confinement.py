@@ -280,3 +280,60 @@ async def test_write_file_dispatch_blocks_cron(monkeypatch):
     )
     assert "outside the allowed roots" in (result.get("error") or "")
     assert result.get("exit_code") == 1
+
+
+# ── Regression: Odysseus' own credential/session stores (issue #2348) ──
+# These files live inside DATA_DIR, which is the agent's primary allowlisted
+# root, so before the deny-list entry read_file/write_file could exfiltrate
+# live session tokens, password hashes, and the Fernet key → admin takeover.
+
+def test_sensitive_credential_basenames():
+    from src.tool_execution import _is_sensitive_path
+    from src.constants import DATA_DIR
+    for name in ("auth.json", "sessions.json", ".app_key", "app.db", "settings.json"):
+        assert _is_sensitive_path(os.path.join(DATA_DIR, name)), name
+        # Blocked by basename regardless of directory.
+        assert _is_sensitive_path(os.path.join("/tmp", name)), name
+
+
+def test_blocks_sessions_json_in_data_dir():
+    """The #2348 vector: sessions.json sits under DATA_DIR (an allowed root)
+    but must be rejected by the sensitive-filename deny list first."""
+    from src.tool_execution import _resolve_tool_path
+    from src.constants import SESSIONS_FILE
+    with pytest.raises(ValueError, match="sensitive"):
+        _resolve_tool_path(SESSIONS_FILE)
+
+
+def test_blocks_auth_json_and_app_key_in_data_dir():
+    from src.tool_execution import _resolve_tool_path
+    from src.constants import AUTH_FILE, APP_KEY_FILE, APP_DB
+    for target in (AUTH_FILE, APP_KEY_FILE, APP_DB):
+        with pytest.raises(ValueError, match="sensitive"):
+            _resolve_tool_path(target)
+
+
+def test_blocks_vault_and_integrations():
+    """Integration-secret stores (vault.json = encrypted secrets,
+    integrations.json = email/calendar provider tokens) must be denied."""
+    from src.tool_execution import _is_sensitive_path, _resolve_tool_path
+    from src.constants import VAULT_FILE, INTEGRATIONS_FILE
+    for target in (VAULT_FILE, INTEGRATIONS_FILE):
+        assert _is_sensitive_path(target), target
+        with pytest.raises(ValueError, match="sensitive"):
+            _resolve_tool_path(target)
+
+
+def test_blocks_symlink_strip_bypass(tmp_path):
+    """Pre-symlink guard (#2348): a symlink whose own name is sensitive (.ssh)
+    but whose target strips that component must still be rejected. realpath
+    alone resolves the link to a non-sensitive dir under an allowed root (/tmp),
+    so only the lexical/pre-symlink path reveals the '.ssh' component."""
+    from src.tool_execution import _resolve_tool_path
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "config").write_text("x")
+    link = tmp_path / ".ssh"
+    link.symlink_to(plain, target_is_directory=True)
+    with pytest.raises(ValueError, match="sensitive"):
+        _resolve_tool_path(str(link / "config"))

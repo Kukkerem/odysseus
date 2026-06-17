@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 from src.llm_core import stream_llm, stream_llm_with_fallback, _is_ollama_native_url
 from src.model_context import estimate_tokens
 from src.settings import get_setting
-from src.prompt_security import untrusted_context_message
+from src.prompt_security import untrusted_context_message, wrap_tool_result
 from src.tool_security import blocked_tools_for_owner, plan_mode_disabled_tools
 from src.tool_policy import GUIDE_ONLY_DIRECTIVE, ToolPolicy
 from src.tool_utils import _truncate, get_mcp_manager
@@ -1571,7 +1571,7 @@ def _append_tool_results(
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.get("id", f"call_{round_num}_{j}"),
-                "content": result_text,
+                "content": wrap_tool_result(result_text),
             })
     else:
         tool_output_text = "\n\n".join(tool_results)
