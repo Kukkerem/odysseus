@@ -16,6 +16,8 @@ venv/
 !.env.example
 # Local uv lockfile (optional, per-platform — see "Faster installs with uv" in README)
 requirements.lock
+# direnv (nix-direnv) cache — generated from flake.nix + .envrc, never committed
+.direnv/
 
 # SOPS workflow — encrypted `secrets.env` is intentionally committable,
 # but every variant (plaintext, manual decrypt copy, editor backup)
