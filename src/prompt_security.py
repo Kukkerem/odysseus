@@ -84,3 +84,22 @@ def untrusted_context_message(label: str, content: Any) -> Dict[str, Any]:
         ),
         "metadata": {"trusted": False, "source": label},
     }
+
+
+def wrap_tool_result(content: Any) -> str:
+    """Fence tool output as untrusted data for the native tool-call path.
+
+    The text/XML tool path routes results through untrusted_context_message(),
+    but native function-calling needs the result to stay in a role="tool"
+    message keyed by tool_call_id, so a user-role envelope can't be swapped in.
+    Wrap the content string with the same guard markers and marker-escaping
+    instead. Tool results (fetched pages, emails, files) are the agent's primary
+    prompt-injection delivery vector. THREAT_MODEL.md.
+    """
+    text = _escape_guard_markers("" if content is None else str(content))
+    return (
+        f"{UNTRUSTED_CONTEXT_HEADER}\n"
+        f"{GUARD_OPEN}\n"
+        f"{text}\n"
+        f"{GUARD_CLOSE}"
+    )

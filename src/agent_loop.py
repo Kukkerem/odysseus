@@ -22,7 +22,7 @@ from src.llm_core import (
 )
 from src.model_context import estimate_tokens
 from src.settings import get_setting
-from src.prompt_security import untrusted_context_message
+from src.prompt_security import untrusted_context_message, wrap_tool_result
 from src.tool_security import blocked_tools_for_owner, plan_mode_disabled_tools
 from src.tool_policy import GUIDE_ONLY_DIRECTIVE, WEB_TOOL_NAMES, ToolPolicy
 from src.tool_utils import _truncate, get_mcp_manager
@@ -2812,7 +2812,7 @@ def _append_tool_results(
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.get("id", f"call_{round_num}_{j}"),
-                "content": result_text,
+                "content": wrap_tool_result(result_text),
             })
     else:
         tool_output_text = "\n\n".join(tool_results)
