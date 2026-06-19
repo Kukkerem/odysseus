@@ -2965,8 +2965,11 @@ function _createCard(em) {
       }
       try {
         if (newState) {
-          await fetch(`${API_BASE}/api/email/mark-answered/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
-          await fetch(`${API_BASE}/api/email/mark-read/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
+          await fetch(`${API_BASE}/api/email/bulk-flag?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ uids: [String(em.uid)], add: ['\\Seen', '\\Answered'] }),
+          });
         } else {
           await fetch(`${API_BASE}/api/email/clear-answered/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
         }
@@ -5574,8 +5577,11 @@ function _showReaderMoreMenu(em, card, reader, anchor) {
         if (newState) _syncEmailReadState(em.uid, true);
         try {
           if (newState) {
-            await fetch(`${API_BASE}/api/email/mark-answered/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
-            await fetch(`${API_BASE}/api/email/mark-read/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
+            await fetch(`${API_BASE}/api/email/bulk-flag?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ uids: [String(em.uid)], add: ['\\Seen', '\\Answered'] }),
+            });
           } else {
             await fetch(`${API_BASE}/api/email/clear-answered/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
           }
@@ -5767,8 +5773,11 @@ function _showCardMenu(em, anchor) {
         if (newState) _syncEmailReadState(em.uid, true); // mark-done implies mark-read
         try {
           if (newState) {
-            await fetch(`${API_BASE}/api/email/mark-answered/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
-            await fetch(`${API_BASE}/api/email/mark-read/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
+            await fetch(`${API_BASE}/api/email/bulk-flag?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ uids: [String(em.uid)], add: ['\\Seen', '\\Answered'] }),
+            });
           } else {
             await fetch(`${API_BASE}/api/email/clear-answered/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
           }
@@ -5980,7 +5989,6 @@ function _updateBulkBar() {
 async function _bulkAction(action) {
   const uids = Array.from(state._selectedUids);
   if (uids.length === 0) return;
-  let failedReadSync = 0;
   if (action === 'delete') {
     const ok = await styledConfirm(
       `Delete ${uids.length} selected email${uids.length === 1 ? '' : 's'}?`,
@@ -6028,6 +6036,66 @@ async function _bulkAction(action) {
   if (selectAll) selectAll.disabled = true;
   if (countEl) countEl.textContent = `${verbing} ${uids.length}…`;
 
+  // Flag-only actions collapse to ONE batched server request.
+  if (action === 'done' || action === 'read' || action === 'unread') {
+    const add = [];
+    const remove = [];
+    if (action === 'done') { add.push('\\Seen', '\\Answered'); }
+    else if (action === 'read') { add.push('\\Seen'); }
+    else if (action === 'unread') { remove.push('\\Seen'); }
+
+    for (const uid of uids) {                       // optimistic UI
+      const em = state._libEmails.find(e => String(e.uid) === String(uid));
+      if (em) {
+        if (action === 'done') { em.is_answered = true; em.is_read = true; }
+        else { em.is_read = (action === 'read'); }
+      }
+      if (action !== 'done') _syncEmailReadState(uid, action === 'read');
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/api/email/bulk-flag?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uids: uids.map(String), add, remove }),
+      });
+      let data = null;
+      try { data = await res.json(); } catch (_) {}
+      if (!res.ok || data?.success === false) {
+        throw new Error(data?.error || `HTTP ${res.status}`);
+      }
+      if (action === 'done' && state._libFilter === 'undone') {
+        await _animateEmailCardRemoval(uids);
+        const removed = new Set(uids.map(uid => String(uid)));
+        state._libEmails = state._libEmails.filter(e => !removed.has(String(e.uid)));
+      }
+      _libCacheWriteBack();
+    } catch (e) {
+      console.error(`Bulk ${action} failed:`, e);
+      showToast(`Failed to update ${uids.length} email${uids.length === 1 ? '' : 's'}`);
+    } finally {
+      if (busySpinner) busySpinner.destroy();
+      if (targetBtn) {
+        targetBtn.disabled = false;
+        targetBtn.classList.remove('email-bulk-loading');
+        targetBtn.innerHTML = originalTargetHtml || targetBtn.innerHTML;
+      }
+      if (deleteBtn && deleteBtn !== targetBtn) {
+        deleteBtn.disabled = false;
+        deleteBtn.innerHTML = originalDeleteHtml || deleteBtn.innerHTML;
+      }
+      if (actionsBtn && actionsBtn !== targetBtn) actionsBtn.disabled = false;
+      if (cancelBtn) cancelBtn.disabled = false;
+      if (selectAll) selectAll.disabled = false;
+      if (countEl) countEl.textContent = originalCountText;
+    }
+    state._selectedUids.clear();
+    state._selectMode = false;
+    _updateBulkBar();
+    _renderGrid();
+    return;
+  }
+
   // Single-uid worker.
   const handleOne = async (uid) => {
     try {
@@ -6035,28 +6103,8 @@ async function _bulkAction(action) {
         await fetch(`${API_BASE}/api/email/archive/${uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
       } else if (action === 'delete') {
         await fetch(`${API_BASE}/api/email/delete/${uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'DELETE' });
-      } else if (action === 'done') {
-        // uid may come back from the Set as a string while em.uid is
-        // numeric (or vice versa) — coerce both sides so the in-memory
-        // state actually flips and the post-loop re-render shows the
-        // done checkmark.
-        const em = state._libEmails.find(e => String(e.uid) === String(uid));
-        if (em) { em.is_answered = true; em.is_read = true; }
-        const ansRes = await fetch(`${API_BASE}/api/email/mark-answered/${uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
-        const readRes = await fetch(`${API_BASE}/api/email/mark-read/${uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
-        if (!ansRes.ok || !readRes.ok) throw new Error(`mark-done HTTP ${ansRes.status}/${readRes.status}`);
-      } else if (action === 'read' || action === 'unread') {
-        const endpoint = action === 'read' ? 'mark-read' : 'mark-unread';
-        const res = await fetch(`${API_BASE}/api/email/${endpoint}/${uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
-        let data = null;
-        try { data = await res.json(); } catch (_) {}
-        if (!res.ok || data?.success === false) {
-          throw new Error(data?.error || `HTTP ${res.status}`);
-        }
-        _syncEmailReadState(uid, action === 'read');
       }
     } catch (e) {
-      if (action === 'read' || action === 'unread') failedReadSync += 1;
       console.error(`Failed to ${action} ${uid}:`, e);
     }
   };
@@ -6092,14 +6140,6 @@ async function _bulkAction(action) {
       await _animateEmailCardRemoval(uids);
       const removed = new Set(uids.map(uid => String(uid)));
       state._libEmails = state._libEmails.filter(e => !removed.has(String(e.uid)));
-    } else if (action === 'done' && state._libFilter === 'undone') {
-      // The undone filter is a "show only not-done" view — after marking
-      // selected emails done, they no longer match. Animate them out and
-      // drop them from the local list so the view reflects the filter
-      // instead of leaving freshly-done cards sitting there.
-      await _animateEmailCardRemoval(uids);
-      const removed = new Set(uids.map(uid => String(uid)));
-      state._libEmails = state._libEmails.filter(e => !removed.has(String(e.uid)));
     }
   } finally {
     if (busySpinner) busySpinner.destroy();
@@ -6122,9 +6162,6 @@ async function _bulkAction(action) {
   state._selectMode = false;
   _updateBulkBar();
   _renderGrid();
-  if (failedReadSync > 0) {
-    showToast(`Failed to update ${failedReadSync} email${failedReadSync === 1 ? '' : 's'}`);
-  }
   // Sync successful local mutations into the SWR cache so reopen doesn't
   // briefly show the pre-bulk state.
   _libCacheWriteBack();

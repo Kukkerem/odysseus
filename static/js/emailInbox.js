@@ -1108,8 +1108,11 @@ async function _toggleDone(em, itemEl) {
   }
   try {
     if (newState) {
-      await fetch(`${API_BASE}/api/email/mark-answered/${em.uid}?folder=${encodeURIComponent(_currentFolder)}${_acct()}`, { method: 'POST' });
-      await fetch(`${API_BASE}/api/email/mark-read/${em.uid}?folder=${encodeURIComponent(_currentFolder)}${_acct()}`, { method: 'POST' });
+      await fetch(`${API_BASE}/api/email/bulk-flag?folder=${encodeURIComponent(_currentFolder)}${_acct()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uids: [String(em.uid)], add: ['\\Seen', '\\Answered'] }),
+      });
     } else {
       await fetch(`${API_BASE}/api/email/clear-answered/${em.uid}?folder=${encodeURIComponent(_currentFolder)}${_acct()}`, { method: 'POST' });
     }

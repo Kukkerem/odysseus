@@ -52,13 +52,16 @@ from routes.email_helpers import (
     _fetch_sender_thread_context, _pre_retrieve_context,
     _EMAIL_REPLY_SYS_PROMPT_BASE, _POOL_HOOKS,
     _friendly_email_auth_error,
-    SendEmailRequest, ExtractStyleRequest,
+    SendEmailRequest, ExtractStyleRequest, BulkFlagRequest,
     ATTACHMENTS_DIR, COMPOSE_UPLOADS_DIR, SCHEDULED_DB,
     attachment_extract_dir, _email_cache_owner_clause,
 )
 from routes.email_pollers import _start_poller
 
 logger = logging.getLogger(__name__)
+
+_BULK_STORE_CHUNK = 500  # bound the IMAP command-line length for a UID set
+_BULK_FLAG_ALLOWED = {"\\Seen", "\\Answered", "\\Flagged"}  # never \\Deleted via bulk
 
 ODYSSEUS_MAIL_ORIGIN = "odysseus-ui"
 
@@ -337,6 +340,19 @@ def _store_email_flag(conn, uid: str, flag: str, add: bool = True) -> bool:
     return status == "OK"
 
 
+def _imap_select(conn, folder, readonly=False):
+    """SELECT `folder` only if this connection isn't already on it in the same
+    read/write mode. Pooled connections persist across requests, so skipping a
+    redundant SELECT (a full server round-trip — ~450ms on remote Gmail) is a
+    large win. The (folder, readonly) key is required: a readonly SELECT left by
+    a search must be re-issued read-write before a STORE."""
+    want = (folder, bool(readonly))
+    if getattr(conn, "_odys_sel", None) == want:
+        return "OK"
+    status, _ = conn.select(_q(folder), readonly=readonly)
+    conn._odys_sel = want if status == "OK" else None
+    return status
+
 def _move_email_message(conn, uid: str, dest: str, role: str = "") -> bool:
     dest = _resolve_mail_folder(conn, dest, role or _folder_role_from_name(dest))
     if _uid_exists(conn, uid):
@@ -529,50 +545,66 @@ def setup_email_routes():
     _WARM_MAX_BYTES = 128 * 1024
     _WARM_RECENT_SECONDS = 7 * 24 * 60 * 60
     _pool_lock = _threading.Lock()
+    _pool_key_locks = {}  # (account_id, owner) → threading.Lock (held while in use)
+
+    def _get_key_lock(pool_key):
+        with _pool_lock:
+            lock = _pool_key_locks.get(pool_key)
+            if lock is None:
+                lock = _threading.Lock()
+                _pool_key_locks[pool_key] = lock
+            return lock
+
 
     def _pooled_connect(account_id, owner=""):
-        """Reuse a live IMAP connection if one is in the pool and still
-        responsive. Otherwise open fresh and store it. Caller must release
-        via _pooled_release after use (not strictly required — the pool
-        holds the same conn handle, and we lock to serialize access).
-
-        SECURITY: `owner` is forwarded to `_imap_connect` so the fallback
-        config lookup (when `account_id` is None) is scoped to this user's
-        accounts only. The pool key is (account_id, owner) so two users
-        with `account_id=None` don't share a pooled connection.
+        """Acquire this account's lock, then reuse a live pooled connection or
+        open a fresh one. The lock is held until `_pooled_release`, so all
+        pooled ops for one account serialize on a single connection (no
+        fresh-connect storm / handle leak under concurrency). Different accounts
+        proceed independently.
         """
         pool_key = (account_id, owner)
-        now = _time.monotonic()
-        with _pool_lock:
-            entry = _IMAP_POOL.get(pool_key)
+        lock = _get_key_lock(pool_key)
+        lock.acquire()
+        try:
+            now = _time.monotonic()
+            with _pool_lock:
+                entry = _IMAP_POOL.pop(pool_key, None)
             if entry:
                 conn, last_used = entry
                 if (now - last_used) < _IMAP_IDLE_MAX:
                     try:
                         conn.noop()
-                        # Pop it out of the pool while we use it (serialize)
-                        del _IMAP_POOL[pool_key]
-                        return conn, True  # reused
+                        return conn, True  # reused (lock stays held)
                     except Exception:
                         try: conn.logout()
                         except Exception: pass
-                        del _IMAP_POOL[pool_key]
                 else:
                     try: conn.logout()
                     except Exception: pass
-                    del _IMAP_POOL[pool_key]
-        # Fresh connection
-        return _imap_connect(account_id, owner=owner), False
+            # Fresh connection (network I/O outside _pool_lock).
+            return _imap_connect(account_id, owner=owner), False
+        except BaseException:
+            # Connect/noop path raised before we could hand the conn back —
+            # release the key lock so the next caller for this account is not
+            # wedged.
+            lock.release()
+            raise
 
     def _pooled_release(account_id, conn, ok=True, owner=""):
-        # SECURITY: match the (account_id, owner) key used by _pooled_connect
-        # so a pooled handle is returned to the same per-user slot.
-        if not ok:
-            try: conn.logout()
-            except Exception: pass
-            return
-        with _pool_lock:
-            _IMAP_POOL[(account_id, owner)] = (conn, _time.monotonic())
+        pool_key = (account_id, owner)
+        try:
+            if not ok:
+                try: conn.logout()
+                except Exception: pass
+                try: conn._odys_sel = None
+                except Exception: pass
+                return
+            with _pool_lock:
+                _IMAP_POOL[pool_key] = (conn, _time.monotonic())
+        finally:
+            # Always release the per-account lock acquired in _pooled_connect.
+            _get_key_lock(pool_key).release()
 
     def _list_cache_key(account_id, folder, filter_, limit, offset, from_addr=""):
         return (account_id or "", folder, filter_, int(limit), int(offset), from_addr or "")
@@ -1136,13 +1168,16 @@ def setup_email_routes():
                                     break
                     except Exception:
                         pass
-                conn.select(_q(effective_folder), readonly=True)
+                _imap_select(conn, effective_folder, readonly=True)
 
                 # Escape backslash and quote for the IMAP-SEARCH quoted-string.
                 q_escaped = q.replace('\\', '\\\\').replace('"', '\\"')
                 search_cmd = f'(OR OR FROM "{q_escaped}" SUBJECT "{q_escaped}" TEXT "{q_escaped}")'
 
-                status, data = _imap_uid_search(conn, search_cmd)
+                # Encode as UTF-8 bytes + CHARSET so accented queries (e.g. "árvíz")
+                # don't blow up imaplib's ASCII command encoder. ASCII is a UTF-8
+                # subset, so plain queries are unaffected.
+                status, data = conn.uid("SEARCH", "CHARSET", "UTF-8", search_cmd.encode("utf-8"))
                 if status != "OK" or not data[0]:
                     return {"emails": [], "total": 0, "query": q, "folder": effective_folder}
 
@@ -1240,7 +1275,7 @@ def setup_email_routes():
         _t_fetch = 0.0
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder), readonly=True)
+                _imap_select(conn, folder, readonly=True)
                 _t_select = _t.monotonic() - _t0
                 status, msg_data = _imap_uid_fetch(conn, uid, "(BODY.PEEK[])")
                 _t_fetch = _t.monotonic() - _t0
@@ -1270,7 +1305,7 @@ def setup_email_routes():
                 # of the same UID don't fight over a shared SELECT state.
                 try:
                     with _imap(account_id, owner=owner) as conn2:
-                        conn2.select(_q(folder))
+                        _imap_select(conn2, folder)
                         conn2.uid("STORE", _uid_bytes(uid), "+FLAGS", "\\Seen")
                 except Exception:
                     pass
@@ -1385,7 +1420,7 @@ def setup_email_routes():
     def _mark_email_seen_sync(uid, folder, account_id, owner):
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
+                _imap_select(conn, folder)
                 conn.uid("STORE", _uid_bytes(uid), "+FLAGS", "\\Seen")
             _invalidate_list_cache(account_id, folder)
         except Exception as e:
@@ -1470,7 +1505,7 @@ def setup_email_routes():
         """List attachments for an email."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder), readonly=True)
+                _imap_select(conn, folder, readonly=True)
                 status, msg_data = _imap_uid_fetch(conn, uid, "(RFC822)")
             if status != "OK":
                 return {"attachments": [], "error": "Email not found"}
@@ -1487,7 +1522,7 @@ def setup_email_routes():
         """Download a specific attachment by email UID and attachment index. Saves to local disk and returns the file."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder), readonly=True)
+                _imap_select(conn, folder, readonly=True)
                 status, msg_data = _imap_uid_fetch(conn, uid, "(RFC822)")
             if status != "OK":
                 return {"error": "Email not found"}
@@ -1523,7 +1558,7 @@ def setup_email_routes():
         """
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder), readonly=True)
+                _imap_select(conn, folder, readonly=True)
                 status, msg_data = _imap_uid_fetch(conn, uid, "(RFC822)")
             if status != "OK":
                 return {"error": "Email not found"}
@@ -1731,7 +1766,7 @@ def setup_email_routes():
         """Extract attachment to local disk and return the path (for AI to read via read_file)."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder), readonly=True)
+                _imap_select(conn, folder, readonly=True)
                 status, msg_data = _imap_uid_fetch(conn, uid, "(RFC822)")
             if status != "OK":
                 return {"error": "Email not found"}
@@ -1749,11 +1784,11 @@ def setup_email_routes():
             return {"error": "Mail operation failed"}
 
     @router.post("/mark-unread/{uid}")
-    async def mark_unread(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+    def mark_unread(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Mark an email as unread (clear \\Seen flag)."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
+                _imap_select(conn, folder)
                 if not _store_email_flag(conn, uid, "\\Seen", add=False):
                     return {"success": False, "error": "Email not found"}
             _invalidate_list_cache(account_id, folder)
@@ -1763,13 +1798,13 @@ def setup_email_routes():
             return {"success": False, "error": "Mail operation failed"}
 
     @router.post("/flag/{uid}")
-    async def flag_email(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None),
+    def flag_email(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None),
                          on: bool = Query(True), owner: str = Depends(require_owner)):
         """Toggle the \\Flagged flag (a.k.a. favorite / star) on an email.
         Pass `on=true` to favorite, `on=false` to unfavorite."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
+                _imap_select(conn, folder)
                 if not _store_email_flag(conn, uid, "\\Flagged", add=bool(on)):
                     return {"success": False, "error": "Email not found"}
             _invalidate_list_cache(account_id, folder)
@@ -1779,11 +1814,11 @@ def setup_email_routes():
             return {"success": False, "error": "Mail operation failed"}
 
     @router.post("/mark-read/{uid}")
-    async def mark_read(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+    def mark_read(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Mark an email as read (set \\Seen flag)."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
+                _imap_select(conn, folder)
                 if not _store_email_flag(conn, uid, "\\Seen", add=True):
                     return {"success": False, "error": "Email not found"}
             _invalidate_list_cache(account_id, folder)
@@ -1799,7 +1834,7 @@ def setup_email_routes():
         """Move email to Archive folder."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
+                _imap_select(conn, folder)
                 if not _move_email_message(conn, uid, "Archive", role="archive"):
                     return {"success": False, "error": "Email not found"}
             _invalidate_list_cache(account_id)
@@ -1809,11 +1844,11 @@ def setup_email_routes():
             return {"success": False, "error": "Mail operation failed"}
 
     @router.delete("/delete/{uid}")
-    async def delete_email(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+    def delete_email(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Move email to Trash."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
+                _imap_select(conn, folder)
                 if not _move_email_message(conn, uid, "Trash", role="trash"):
                     return {"success": False, "error": "Email not found"}
             _invalidate_list_cache(account_id)
@@ -1823,11 +1858,11 @@ def setup_email_routes():
             return {"success": False, "error": "Mail operation failed"}
 
     @router.delete("/delete-permanent/{uid}")
-    async def delete_email_permanent(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+    def delete_email_permanent(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Permanently delete an email (no Trash)."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
+                _imap_select(conn, folder)
                 if not _store_email_flag(conn, uid, "\\Deleted", add=True):
                     return {"success": False, "error": "Email not found"}
                 conn.expunge()
@@ -1838,7 +1873,7 @@ def setup_email_routes():
             return {"success": False, "error": "Mail operation failed"}
 
     @router.delete("/odysseus/reminders")
-    async def delete_odysseus_reminder_emails(
+    def delete_odysseus_reminder_emails(
         account_id: str | None = Query(None),
         permanent: bool = Query(False),
         owner: str = Depends(require_owner),
@@ -1873,7 +1908,7 @@ def setup_email_routes():
                         continue
                     seen.add(folder_name)
                     try:
-                        st, _ = conn.select(_q(folder_name))
+                        st = _imap_select(conn, folder_name)
                         if st != "OK":
                             continue
                         folders_checked.append(folder_name)
@@ -1913,11 +1948,11 @@ def setup_email_routes():
             return {"success": False, "error": "Mail operation failed"}
 
     @router.post("/move/{uid}")
-    async def move_email(uid: str, folder: str = Query("INBOX"), dest: str = Query(...), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+    def move_email(uid: str, folder: str = Query("INBOX"), dest: str = Query(...), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Move an email to another folder."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
+                _imap_select(conn, folder)
                 if not _move_email_message(conn, uid, dest):
                     return {"success": False, "error": f"Failed to move to {dest}"}
             _invalidate_list_cache(account_id)
@@ -1927,7 +1962,7 @@ def setup_email_routes():
             return {"success": False, "error": "Mail operation failed"}
 
     @router.get("/folders")
-    async def list_folders(account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+    def list_folders(account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """List IMAP folders."""
         try:
             with _imap(account_id, owner=owner) as conn:
@@ -1945,11 +1980,11 @@ def setup_email_routes():
             return {"folders": [], "error": "Mail operation failed"}
 
     @router.post("/mark-answered/{uid}")
-    async def mark_answered(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+    def mark_answered(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Mark an email as answered (set \\Answered flag)."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
+                _imap_select(conn, folder)
                 if not _store_email_flag(conn, uid, "\\Answered", add=True):
                     return {"success": False, "error": "Email not found"}
             return {"success": True}
@@ -1958,16 +1993,54 @@ def setup_email_routes():
             return {"success": False, "error": "Mail operation failed"}
 
     @router.post("/clear-answered/{uid}")
-    async def clear_answered(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+    def clear_answered(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Clear the \\Answered flag from an email."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
+                _imap_select(conn, folder)
                 if not _store_email_flag(conn, uid, "\\Answered", add=False):
                     return {"success": False, "error": "Email not found"}
             return {"success": True}
         except Exception as e:
             logger.error(f"Failed to clear answered {uid}: {e}")
+            return {"success": False, "error": "Mail operation failed"}
+
+    @router.post("/bulk-flag")
+    # Sync def: blocking IMAP I/O with no awaits — runs in a threadpool.
+    def bulk_flag(req: BulkFlagRequest, folder: str = Query("INBOX"),
+                  account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+        """Add/remove IMAP flags on a set of UIDs in one batched STORE.
+
+        Collapses the UI's per-email "mark done / read / unread" requests into a
+        single round-trip. `add`/`remove` are restricted to \\Seen \\Answered
+        \\Flagged; \\Deleted is intentionally excluded so this cannot mass-delete.
+        """
+        if account_id:
+            _assert_owns_account(account_id, owner)
+        uids = [str(u) for u in (req.uids or [])]
+        if not uids or not all(re.fullmatch(r"\d+", u) for u in uids):
+            raise HTTPException(400, "Invalid uids")
+        add = list(req.add or [])
+        remove = list(req.remove or [])
+        if not add and not remove:
+            raise HTTPException(400, "No flags to change")
+        if any(f not in _BULK_FLAG_ALLOWED for f in add + remove):
+            raise HTTPException(400, "Unsupported flag")
+        try:
+            with _imap(account_id, owner=owner) as conn:
+                _imap_select(conn, folder)
+                for i in range(0, len(uids), _BULK_STORE_CHUNK):
+                    seqset = ",".join(uids[i:i + _BULK_STORE_CHUNK]).encode()
+                    if add:
+                        conn.uid("STORE", seqset, "+FLAGS", "(" + " ".join(add) + ")")
+                    if remove:
+                        conn.uid("STORE", seqset, "-FLAGS", "(" + " ".join(remove) + ")")
+            _invalidate_list_cache(account_id, folder)
+            return {"success": True, "count": len(uids), "folder": folder}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"bulk_flag failed: {e}")
             return {"success": False, "error": "Mail operation failed"}
 
     @router.post("/compose-upload")
@@ -2237,7 +2310,7 @@ def setup_email_routes():
                 matches = {}
                 for folder in ["Sent", "INBOX", "Drafts"]:
                     try:
-                        st, _ = conn.select(_q(folder), readonly=True)
+                        st = _imap_select(conn, folder, readonly=True)
                         if st != "OK":
                             continue
                         st, data = conn.search(None, "ALL")
@@ -2396,7 +2469,7 @@ def setup_email_routes():
                                 sent_uid = m.group(1).decode("ascii", errors="ignore")
                         if not sent_uid:
                             try:
-                                st_sel, _ = imap.select(_q(sent_folder), readonly=True)
+                                st_sel = _imap_select(imap, sent_folder, readonly=True)
                                 if st_sel == "OK":
                                     mid = (_message_id or "").strip().lstrip("<").rstrip(">").replace('"', '\\"')
                                     st_uid, uid_data = imap.uid("SEARCH", None, f'HEADER Message-ID "{mid}"')
@@ -2422,7 +2495,7 @@ def setup_email_routes():
                                 )
                                 for folder_name in dict.fromkeys(folder_candidates):
                                     try:
-                                        st, _sel = imap.select(_q(folder_name), readonly=False)
+                                        st = _imap_select(imap, folder_name, readonly=False)
                                         if st != "OK":
                                             continue
                                         st2, sd = imap.search(None, f'HEADER Message-ID "{mid}"')
@@ -2528,7 +2601,7 @@ def setup_email_routes():
         def _gather_samples() -> tuple[list[str], str | None]:
             try:
                 with _imap(owner=owner) as imap:
-                    imap.select(_q(_detect_sent_folder(imap)), readonly=True)
+                    _imap_select(imap, _detect_sent_folder(imap), readonly=True)
                     status, data = imap.search(None, "ALL")
                     if status != "OK" or not data[0]:
                         return [], "No sent emails found"
@@ -2646,7 +2719,7 @@ def setup_email_routes():
                 try:
                     def _fetch_atts():
                         with _imap(account_id, owner=owner) as conn:
-                            conn.select(_q(folder), readonly=True)
+                            _imap_select(conn, folder, readonly=True)
                             status, msg_data = _imap_uid_fetch(conn, str(uid), "(BODY.PEEK[])")
                             if status != "OK" or not msg_data or not msg_data[0]:
                                 return ""
