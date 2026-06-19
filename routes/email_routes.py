@@ -247,6 +247,36 @@ def _imap_uid_search(conn, criteria: str):
     return conn.uid("SEARCH", None, criteria)
 
 
+def _imap_uid_search_query(conn, q: str):
+    """UID SEARCH across FROM/SUBJECT/TEXT for a free-text query; returns the
+    matching UID bytes (ascending — caller reverses for newest-first).
+
+    ASCII queries use one inline SEARCH. Non-ASCII can't go inline: RFC 3501
+    bans 8-bit octets on the command line and Gmail answers "Could not parse
+    command". imaplib sends at most one literal per command, so the
+    OR-across-three-fields is issued as three `CHARSET UTF-8` literal searches
+    (FROM, SUBJECT, TEXT) and unioned. The literal is an astring, so the term
+    needs no quoting/escaping. Accented search is interactive but rare, so the
+    two extra round-trips are acceptable."""
+    if q.isascii():
+        q_escaped = q.replace('\\', '\\\\').replace('"', '\\"')
+        criteria = f'(OR OR FROM "{q_escaped}" SUBJECT "{q_escaped}" TEXT "{q_escaped}")'
+        status, data = conn.uid("SEARCH", None, criteria)
+        if status != "OK" or not data or not data[0]:
+            return []
+        return data[0].split()
+
+    term = q.encode("utf-8")
+    seen = set()
+    for field in ("FROM", "SUBJECT", "TEXT"):
+        conn.literal = term  # imaplib appends ` {N}` + sends bytes after the +
+        status, data = conn.uid("SEARCH", "CHARSET", "UTF-8", field)
+        if status != "OK" or not data or not data[0]:
+            continue
+        seen.update(data[0].split())
+    return sorted(seen, key=lambda u: int(u))
+
+
 def _imap_uid_fetch(conn, uid_set: str | bytes, query: str):
     return conn.uid("FETCH", _uid_bytes(uid_set), query)
 
@@ -1170,18 +1200,10 @@ def setup_email_routes():
                         pass
                 _imap_select(conn, effective_folder, readonly=True)
 
-                # Escape backslash and quote for the IMAP-SEARCH quoted-string.
-                q_escaped = q.replace('\\', '\\\\').replace('"', '\\"')
-                search_cmd = f'(OR OR FROM "{q_escaped}" SUBJECT "{q_escaped}" TEXT "{q_escaped}")'
-
-                # Encode as UTF-8 bytes + CHARSET so accented queries (e.g. "árvíz")
-                # don't blow up imaplib's ASCII command encoder. ASCII is a UTF-8
-                # subset, so plain queries are unaffected.
-                status, data = conn.uid("SEARCH", "CHARSET", "UTF-8", search_cmd.encode("utf-8"))
-                if status != "OK" or not data[0]:
+                uid_list = _imap_uid_search_query(conn, q)
+                if not uid_list:
                     return {"emails": [], "total": 0, "query": q, "folder": effective_folder}
 
-                uid_list = data[0].split()
                 total = len(uid_list)
                 uid_list = list(reversed(uid_list))[:limit]
 
