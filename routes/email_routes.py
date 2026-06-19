@@ -462,6 +462,43 @@ def _imap_uid_search(conn, criteria: str):
     return conn.uid("SEARCH", None, criteria)
 
 
+# Fields probed one-at-a-time on the non-ASCII path. Mirrors the field set
+# _email_imap_search_criteria uses inline, so accented and plain queries match
+# the same places.
+_SEARCH_LITERAL_FIELDS = ("FROM", "TO", "CC", "SUBJECT", "TEXT")
+
+
+def _imap_uid_search_query(conn, q: str):
+    """UID SEARCH across FROM/SUBJECT/TEXT for a free-text query; returns the
+    matching UID bytes (ascending — caller reverses for newest-first).
+
+    ASCII queries use one inline SEARCH. Non-ASCII can't go inline: RFC 3501
+    bans 8-bit octets on the command line and Gmail answers "Could not parse
+    command". imaplib sends at most one literal per command, so the
+    OR-across-fields is issued as one `CHARSET UTF-8` literal search per field
+    (FROM, TO, CC, SUBJECT, TEXT) and unioned. The literal is an astring, so the
+    term needs no quoting/escaping. Accented search is interactive but rare, so
+    the extra round-trips are acceptable."""
+    if q.isascii():
+        # ASCII goes inline through the shared criteria builder, which also
+        # handles multi-term queries and searches recipients (TO/CC), not just
+        # FROM/SUBJECT/TEXT.
+        status, data = conn.uid("SEARCH", None, _email_imap_search_criteria(q))
+        if status != "OK" or not data or not data[0]:
+            return []
+        return data[0].split()
+
+    term = q.encode("utf-8")
+    seen = set()
+    for field in _SEARCH_LITERAL_FIELDS:
+        conn.literal = term  # imaplib appends ` {N}` + sends bytes after the +
+        status, data = conn.uid("SEARCH", "CHARSET", "UTF-8", field)
+        if status != "OK" or not data or not data[0]:
+            continue
+        seen.update(data[0].split())
+    return sorted(seen, key=lambda u: int(u))
+
+
 def _imap_uid_fetch(conn, uid_set: str | bytes, query: str):
     return conn.uid("FETCH", _uid_bytes(uid_set), query)
 
@@ -2803,19 +2840,20 @@ def setup_email_routes():
                         pass
                 _imap_select(conn, effective_folder, readonly=True)
 
-                search_cmd = _email_imap_search_criteria(q)
-
-                # Encode as UTF-8 bytes + CHARSET so accented queries (e.g. "árvíz")
-                # don't blow up imaplib's ASCII command encoder. ASCII is a UTF-8
-                # subset, so plain queries are unaffected.
-                status, data = conn.uid("SEARCH", "CHARSET", "UTF-8", search_cmd.encode("utf-8"))
-                if status != "OK" or not data[0]:
+                # Non-ASCII queries cannot be sent inline: RFC 3501 bans 8-bit
+                # octets on the command line and Gmail answers "Could not parse
+                # command". _imap_uid_search_query issues per-field CHARSET UTF-8
+                # literal searches and unions them. It reports a failed search as
+                # an empty list, so the index fallback below covers both an empty
+                # result and a failure (hence the single imap_empty reason).
+                uid_list = _imap_uid_search_query(conn, q)
+                if not uid_list:
                     if indexed_response and indexed_response.get("emails"):
                         indexed_response["fallback"] = True
                         indexed_response["source"] = "index"
                         indexed_response["sync"] = {
                             **(indexed_response.get("sync") or {}),
-                            "fallback_reason": "imap_empty" if status == "OK" else "imap_search_failed",
+                            "fallback_reason": "imap_empty",
                         }
                         return indexed_response
                     return {
@@ -2830,7 +2868,6 @@ def setup_email_routes():
                         },
                     }
 
-                uid_list = data[0].split()
                 total = len(uid_list)
                 uid_list = list(reversed(uid_list))[:limit]
 
