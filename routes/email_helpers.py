@@ -1876,5 +1876,11 @@ class SendEmailRequest(BaseModel):
     wait_for_delivery: bool = False
 
 
+
+class BulkFlagRequest(BaseModel):
+    uids: List[str]
+    add: Optional[List[str]] = None
+    remove: Optional[List[str]] = None
+
 class ExtractStyleRequest(BaseModel):
     sample_count: Optional[int] = 20

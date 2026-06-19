@@ -22,25 +22,19 @@ def _function_source(name: str) -> str:
     return text[start:end]
 
 
-def test_email_bulk_read_unread_calls_provider_write_routes():
-    """Bulk read/unread must persist to IMAP/provider, not only mutate UI state.
-
-    Regression for issue #800's email follow-up: list select -> Actions ->
-    Mark Read used to update `em.is_read` locally and cache that fake state,
-    then refresh from the provider made the message unread again.
-    """
+def test_bulk_flag_actions_use_single_bulk_flag_request():
+    """Bulk done/read/unread must issue ONE /bulk-flag request over all UIDs,
+    not a per-UID loop of mark-read/mark-answered."""
     src = _bulk_action_source()
-
     assert "Local toggle for now" not in src
-    assert "mark-read" in src
-    assert "mark-unread" in src
-    assert "method: 'POST'" in src
-    assert "_syncEmailReadState(uid, action === 'read')" in src
+    assert "/api/email/bulk-flag" in src
+    assert "JSON.stringify" in src
+    # done sets both flags; read/unread toggle \Seen via add/remove
+    assert "Answered" in src and "Seen" in src
 
 
-def test_email_bulk_read_unread_checks_backend_success_before_syncing_cache():
+def test_bulk_flag_checks_backend_success_before_syncing_cache():
     src = _bulk_action_source()
-
     assert "data?.success === false" in src
     assert "throw new Error(data?.error" in src
     assert "_libCacheWriteBack()" in src
