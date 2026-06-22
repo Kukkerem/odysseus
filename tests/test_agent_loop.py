@@ -323,7 +323,10 @@ class TestAppendToolResultsNativeContent:
         # tool result follows as a role:tool message keyed by tool_call_id
         assert messages[1]["role"] == "tool"
         assert messages[1]["tool_call_id"] == "call_abc"
-        assert messages[1]["content"] == "page text"
+        # Native-path tool output is fenced as untrusted source data
+        # (prompt-injection defense, THREAT_MODEL.md) via wrap_tool_result.
+        from src.prompt_security import wrap_tool_result
+        assert messages[1]["content"] == wrap_tool_result("page text")
 
     def test_whitespace_only_text_yields_null_content(self):
         messages = []
