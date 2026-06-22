@@ -139,7 +139,7 @@ def test_sync_caldav_decrypts_stored_password_and_validates_url(monkeypatch):
 
     captured = {}
 
-    def fake_sync_blocking(owner, url, username, password, account_id=""):
+    def fake_sync_blocking(owner, url, username, password, account_id="", access_token=None, read_only=False):
         captured.update(
             {
                 "owner": owner,
