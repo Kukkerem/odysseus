@@ -8664,6 +8664,12 @@ button.hamburger {
 /* Hide thinking sections globally via settings toggle */
 body.hide-thinking .thinking-section { display: none !important; }
 
+/* Widen chat area via settings toggle */
+body.fullwidth-chat .chat-history {
+  padding-left: 0 !important;
+  padding-right: 12px !important;
+}
+
 /* Thinking process styles — colors follow theme accent */
 .msg .body .stream-content {
   width: 100%;
@@ -16954,7 +16960,8 @@ body:not(.email-doc-split-active) #email-lib-modal.email-lib-fullscreen:not(.mod
 /* Kebab dropdown */
 .skill-kebab-menu {
   position: fixed;
-  z-index: 100002;
+  /* z-index is set inline via topPortalZ() at open time (#4720); a static
+     value here loses once the modal bring-to-front counter climbs past it. */
   min-width: 150px;
   padding: 4px;
   background: var(--panel, var(--bg));
