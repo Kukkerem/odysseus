@@ -183,6 +183,12 @@ def _event_fields_from_component(comp):
     else:
         end_dt = start_dt + timedelta(hours=1)
 
+    # Clamp a non-positive duration (DTEND <= DTSTART) to a positive span so the
+    # row isn't silently dropped by the list_events overlap filter (upstream
+    # parity). Local import dodges the routes<->caldav_sync circular dependency.
+    from routes.calendar_routes import _ensure_positive_duration
+    end_dt = _ensure_positive_duration(start_dt, end_dt, all_day)
+
     # is_utc reflects whether the source carried a TZ we converted from.
     # All-day = no TZ semantics.
     row_is_utc = (

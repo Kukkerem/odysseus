@@ -4062,6 +4062,31 @@ body.bg-pattern-sparkles {
     @keyframes toastCheckDraw {
       to { stroke-dashoffset: 0; }
     }
+    .toast-close-btn {
+      margin-left: 8px;
+      padding: 0;
+      width: 22px;
+      height: 22px;
+      line-height: 1;
+      border: none;
+      background: none;
+      color: var(--fg);
+      opacity: 0.5;
+      cursor: pointer;
+      font-size: 16px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: auto;
+      flex-shrink: 0;
+      transition: transform 0.22s ease, opacity 0.15s ease, background 0.15s ease;
+    }
+    .toast-close-btn:hover {
+      opacity: 1;
+      transform: rotate(90deg);
+      background: color-mix(in srgb, var(--fg) 8%, transparent);
+    }
     .toast.exiting {
       opacity: 0;
       transform: translateX(-120%);
@@ -34092,7 +34117,7 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
   word-break: break-all;
 }
 .note-link:hover { opacity: 0.8; }
-.note-checkbox-rm {
+.note-checkbox-edit, .note-checkbox-rm {
   flex: 0 0 auto;
   background: transparent;
   border: none;
@@ -34104,13 +34129,25 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
   display: flex;
   align-items: center;
   justify-content: center;
-  margin-left: auto;
-  margin-right: 0;
+  margin-left: 2px;
   transition: opacity 0.12s, background 0.12s, color 0.12s;
 }
+.note-checkbox-rm { margin-left: auto; }
+.note-checkbox-edit { margin-left: auto; }
+.note-checkbox:hover .note-checkbox-edit,
 .note-checkbox:hover .note-checkbox-rm { opacity: 0.55; }
 .note-checkbox-rm:hover { opacity: 1 !important; color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); }
+.note-checkbox-edit:hover { opacity: 1 !important; color: var(--accent, var(--blue)); background: color-mix(in srgb, var(--accent, var(--blue)) 12%, transparent); }
+.note-card-selectmode .note-checkbox-edit,
 .note-card-selectmode .note-checkbox-rm { display: none; }
+.note-check-text[contenteditable="true"] {
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  outline: 1px solid var(--accent, var(--blue));
+  border-radius: 2px;
+  cursor: text;
+  padding: 0 2px;
+  margin: 0 -2px;
+}
 .note-check-dot {
   width: 16px;
   height: 16px;
