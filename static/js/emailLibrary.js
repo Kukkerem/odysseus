@@ -3169,6 +3169,13 @@ async function _toggleCardPreview(card, em) {
   // from "All Mail" carry folder="[Gmail]/All Mail"). Falls back to the
   // currently-selected folder for normal inbox cards.
   const folderAtStart = (em && em.folder) || state._libFolder || 'INBOX';
+  // Snapshot the LIBRARY folder separately: `folderAtStart` above is the
+  // email's own folder (e.g. "[Gmail]/All Mail" for a search hit), which is
+  // intentionally different from the library's current folder. The staleness
+  // guard below must compare the live library folder to this snapshot — not to
+  // the email's folder — or opening a cross-folder search result bails out and
+  // spins forever.
+  const libFolderAtStart = state._libFolder || 'INBOX';
   const uidAtStart = String(em?.uid || card?.dataset?.uid || '');
   const grid = card.closest('.doclib-grid');
   const gridRect = grid?.getBoundingClientRect?.();
@@ -3245,7 +3252,7 @@ async function _toggleCardPreview(card, em) {
     const data = await res.json();
     if (
       accountAtStart !== (state._libAccountId || '') ||
-      folderAtStart !== (state._libFolder || 'INBOX') ||
+      libFolderAtStart !== (state._libFolder || 'INBOX') ||
       uidAtStart !== String(card?.dataset?.uid || '') ||
       !card.isConnected ||
       !card.classList.contains('email-card-expanded')
