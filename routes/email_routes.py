@@ -1529,44 +1529,77 @@ def setup_email_routes():
     _FOLDER_TTL = 5 * 60.0
     _READ_CACHE = {}  # key → (expires_at, response_dict)
     _READ_TTL = 30 * 60.0
-    _IMAP_POOL = {}   # account_id → (conn, last_used_at)
+    # Per (account_id, owner): a list of idle live connections. A
+    # BoundedSemaphore caps how many connections one key may have checked out
+    # at once, so a background scan reading many messages no longer serializes
+    # interactive reads behind one shared connection — up to
+    # _IMAP_POOL_MAX_PER_KEY ops run concurrently. Live conns per key stay
+    # <= 2*N (checked-out + idle), well under Gmail's ~15-per-account limit.
+    _IMAP_POOL = {}   # (account_id, owner) → list[(conn, last_used_at)]
+    _IMAP_POOL_MAX_PER_KEY = 3
     _IMAP_IDLE_MAX = 60.0
+    # Cap the liveness probe on a reused pooled connection. The full IMAP
+    # socket timeout (_IMAP_TIMEOUT_SECONDS, ~30s) is for real reads; a dead
+    # idle handle must be detected far faster than that.
+    _IMAP_PROBE_TIMEOUT = 5.0
     _WARMING_READS = set()
     _WARM_READ_LIMIT = 6
     _WARM_MAX_BYTES = 192 * 1024
     _WARM_RECENT_SECONDS = 7 * 24 * 60 * 60
     _pool_lock = _threading.Lock()
-    _pool_key_locks = {}  # (account_id, owner) → threading.Lock (held while in use)
+    _pool_key_sems = {}  # (account_id, owner) → BoundedSemaphore (caps concurrent checkouts)
 
-    def _get_key_lock(pool_key):
+    def _get_key_sem(pool_key):
         with _pool_lock:
-            lock = _pool_key_locks.get(pool_key)
-            if lock is None:
-                lock = _threading.Lock()
-                _pool_key_locks[pool_key] = lock
-            return lock
+            sem = _pool_key_sems.get(pool_key)
+            if sem is None:
+                sem = _threading.BoundedSemaphore(_IMAP_POOL_MAX_PER_KEY)
+                _pool_key_sems[pool_key] = sem
+            return sem
 
 
     def _pooled_connect(account_id, owner=""):
-        """Acquire this account's lock, then reuse a live pooled connection or
-        open a fresh one. The lock is held until `_pooled_release`, so all
-        pooled ops for one account serialize on a single connection (no
-        fresh-connect storm / handle leak under concurrency). Different accounts
-        proceed independently.
+        """Check out a pooled IMAP connection for this (account, owner).
+
+        Acquire the key's semaphore (blocks only once _IMAP_POOL_MAX_PER_KEY
+        connections are already checked out for this key), then reuse a live
+        idle connection or open a fresh one. The permit is held until
+        `_pooled_release`, bounding concurrent connections per key while letting
+        independent ops (e.g. an interactive read and a background scan) run in
+        parallel instead of serializing on one shared connection.
         """
         pool_key = (account_id, owner)
-        lock = _get_key_lock(pool_key)
-        lock.acquire()
+        sem = _get_key_sem(pool_key)
+        sem.acquire()
         try:
             now = _time.monotonic()
+            entry = None
             with _pool_lock:
-                entry = _IMAP_POOL.pop(pool_key, None)
+                idle = _IMAP_POOL.get(pool_key)
+                if idle:
+                    entry = idle.pop()
             if entry:
                 conn, last_used = entry
                 if (now - last_used) < _IMAP_IDLE_MAX:
+                    # Liveness probe under a short timeout. A connection the
+                    # server (or an intermediate NAT) silently dropped while idle
+                    # answers nothing, so conn.noop() would otherwise block for
+                    # the full IMAP socket timeout (~30s) before failing — turning
+                    # a cold click into a multi-second/minute "stuck loading".
+                    # Cap the probe so a dead handle is detected fast, then fall
+                    # through to a fresh connect.
                     try:
+                        _prev_to = None
+                        try:
+                            _prev_to = conn.sock.gettimeout()
+                            conn.sock.settimeout(_IMAP_PROBE_TIMEOUT)
+                        except Exception:
+                            _prev_to = None
                         conn.noop()
-                        return conn, True  # reused (lock stays held)
+                        if _prev_to is not None:
+                            try: conn.sock.settimeout(_prev_to)
+                            except Exception: pass
+                        return conn, True  # reused (permit stays held)
                     except Exception:
                         try: conn.logout()
                         except Exception: pass
@@ -1576,10 +1609,9 @@ def setup_email_routes():
             # Fresh connection (network I/O outside _pool_lock).
             return _imap_connect(account_id, owner=owner), False
         except BaseException:
-            # Connect/noop path raised before we could hand the conn back —
-            # release the key lock so the next caller for this account is not
-            # wedged.
-            lock.release()
+            # Open/probe path raised before we could hand back a conn — release
+            # the permit so the next caller for this key is not wedged.
+            sem.release()
             raise
 
     def _pooled_release(account_id, conn, ok=True, owner=""):
@@ -1591,11 +1623,19 @@ def setup_email_routes():
                 try: conn._odys_sel = None
                 except Exception: pass
                 return
+            pooled = False
             with _pool_lock:
-                _IMAP_POOL[pool_key] = (conn, _time.monotonic())
+                idle = _IMAP_POOL.setdefault(pool_key, [])
+                if len(idle) < _IMAP_POOL_MAX_PER_KEY:
+                    idle.append((conn, _time.monotonic()))
+                    pooled = True
+            if not pooled:
+                # Idle pool already full — close this extra connection.
+                try: conn.logout()
+                except Exception: pass
         finally:
-            # Always release the per-account lock acquired in _pooled_connect.
-            _get_key_lock(pool_key).release()
+            # Always release the permit acquired in _pooled_connect.
+            _get_key_sem(pool_key).release()
 
     def _list_cache_key(account_id, folder, filter_, limit, offset, from_addr=""):
         return (account_id or "", folder, filter_, int(limit), int(offset), from_addr or "")
