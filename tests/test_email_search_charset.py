@@ -103,7 +103,7 @@ def test_search_endpoint_non_ascii_does_not_error(monkeypatch):
     router = email_routes.setup_email_routes()
     search = _endpoint(router, "/api/email/search", "GET")
 
-    result = search(q="árvíz", folder="INBOX", limit=50, account_id=None, owner="")
+    result = search(q="árvíz", folder="INBOX", limit=50, account_id=None, local_only=False, scope="all", owner="")
 
     assert "error" not in result
     assert result["emails"] == []
@@ -124,7 +124,7 @@ def test_search_endpoint_ascii_query_still_works(monkeypatch):
     router = email_routes.setup_email_routes()
     search = _endpoint(router, "/api/email/search", "GET")
 
-    result = search(q="invoice", folder="INBOX", limit=50, account_id=None, owner="")
+    result = search(q="invoice", folder="INBOX", limit=50, account_id=None, local_only=False, scope="all", owner="")
 
     assert "error" not in result
     assert len(conn.searches) == 1
