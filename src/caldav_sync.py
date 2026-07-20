@@ -463,246 +463,248 @@ def _sync_blocking(owner: str, url: str, username: str, password: str,
     result = {"calendars": 0, "events": 0, "deleted": 0, "skipped": 0, "errors": []}
 
     client = _build_dav_client(url, username, password, access_token)
-
-    # Discovery: try principal → calendars first; if the server doesn't
-    # support discovery (or the URL points directly at a calendar), fall
-    # back to treating the URL as a single calendar.
-    calendars = []
     try:
-        principal = client.principal()
-        calendars = principal.calendars()
-    except (AuthorizationError, NotFoundError) as e:
-        if access_token is None and _is_google_host(url):
-            result["errors"].append(
-                "Google rejected the app password (v2 CalDAV requires OAuth). "
-                "Use 'Connect Google Calendar'.")
-        else:
-            result["errors"].append(f"Discovery failed: {e}")
-        return result
-    except Exception as e:
-        logger.info(f"CalDAV principal discovery failed, trying URL as calendar: {e}")
+        # Discovery: try principal → calendars first; if the server doesn't
+        # support discovery (or the URL points directly at a calendar), fall
+        # back to treating the URL as a single calendar.
+        calendars = []
         try:
-            calendars = [_open_url_as_calendar(client, url)]
-        except Exception as e2:
-            result["errors"].append(f"Could not open URL as calendar: {e2}")
-            return result
-
-    if not calendars:
-        try:
-            calendars = [_open_url_as_calendar(client, url)]
+            principal = client.principal()
+            calendars = principal.calendars()
+        except (AuthorizationError, NotFoundError) as e:
+            if access_token is None and _is_google_host(url):
+                result["errors"].append(
+                    "Google rejected the app password (v2 CalDAV requires OAuth). "
+                    "Use 'Connect Google Calendar'.")
+            else:
+                result["errors"].append(f"Discovery failed: {e}")
+            return result          # outer finally will call client.close()
         except Exception as e:
-            result["errors"].append(f"No calendars and URL fallback failed: {e}")
-            return result
-
-    start = datetime.utcnow() - timedelta(days=_LOOKBACK_DAYS)
-    end = datetime.utcnow() + timedelta(days=_LOOKAHEAD_DAYS)
-
-    db = SessionLocal()
-    try:
-        for remote_cal in calendars:
+            logger.info(f"CalDAV principal discovery failed, trying URL as calendar: {e}")
             try:
-                remote_url = str(remote_cal.url)
-                cal_id = _stable_cal_id(remote_url, owner=owner, account_id=account_id)
-                display_name = (remote_cal.name or "").strip() or "CalDAV"
+                calendars = [_open_url_as_calendar(client, url)]
+            except Exception as e2:
+                result["errors"].append(f"Could not open URL as calendar: {e2}")
+                return result          # outer finally will call client.close()
 
-                local_cal = db.query(CalendarCal).filter(
-                    CalendarCal.id == cal_id,
-                    CalendarCal.owner == owner,
-                ).first()
-                if not local_cal:
-                    local_cal = CalendarCal(
-                        id=cal_id,
-                        owner=owner,
-                        name=display_name,
-                        color="#5b8abf",
-                        source="caldav",
-                        account_id=account_id or None,
-                        caldav_base_url=remote_url,
-                    )
-                    db.add(local_cal)
-                    db.commit()
-                else:
-                    # Refresh display name and stamp CalDAV metadata if missing.
-                    changed = False
-                    if local_cal.name != display_name:
-                        local_cal.name = display_name
-                        changed = True
-                    if account_id and not local_cal.account_id:
-                        local_cal.account_id = account_id
-                        changed = True
-                    if local_cal.caldav_base_url != remote_url:
-                        local_cal.caldav_base_url = remote_url
-                        changed = True
-                    if changed:
-                        db.commit()
-                result["calendars"] += 1
+        if not calendars:
+            try:
+                calendars = [_open_url_as_calendar(client, url)]
+            except Exception as e:
+                result["errors"].append(f"No calendars and URL fallback failed: {e}")
+                return result          # outer finally will call client.close()
 
-                # Fetch events in window. `date_search` returns CalendarObject
-                # resources; each may contain one VEVENT (most servers) or
-                # several (rare).
-                from icalendar import Calendar as iCal
+        start = datetime.utcnow() - timedelta(days=_LOOKBACK_DAYS)
+        end = datetime.utcnow() + timedelta(days=_LOOKAHEAD_DAYS)
 
-                seen_uids = set()
-                # Track events added to the session but not yet committed so
-                # duplicate UIDs within the same batch are updated, not re-inserted
-                # (which would violate the UNIQUE constraint on commit).
-                pending: dict = {}
-                parse_failed = False
+        db = SessionLocal()        # if this raises, outer finally still calls client.close()
+        try:
+            for remote_cal in calendars:
                 try:
-                    if access_token and _is_google_host(remote_url):
-                        # OAuth Google: caldav 3.2.x search() lazy-loads each
-                        # object with a per-href GET that Google 404s ("No events
-                        # found."); fetch via a direct REPORT with inline
-                        # calendar-data. Basic-auth Google stays on date_search
-                        # below so its "needs OAuth" diagnostic still fires.
-                        objs = _google_report_events(client, remote_url, start, end)
-                    else:
-                        objs = remote_cal.date_search(start=start, end=end, expand=False)
-                except NotFoundError as e:
-                    if access_token is None and _is_google_host(url):
-                        result["errors"].append(
-                            f"{display_name}: primary calendar rejected basic-auth CalDAV — "
-                            "this Google Workspace account needs OAuth. Use 'Connect Google Calendar'.")
-                    else:
-                        result["errors"].append(f"{display_name}: date_search failed ({e})")
-                    continue
-                except Exception as e:
-                    result["errors"].append(f"{display_name}: date_search failed ({e})")
-                    continue
+                    remote_url = str(remote_cal.url)
+                    cal_id = _stable_cal_id(remote_url, owner=owner, account_id=account_id)
+                    display_name = (remote_cal.name or "").strip() or "CalDAV"
 
-                for obj in objs:
+                    local_cal = db.query(CalendarCal).filter(
+                        CalendarCal.id == cal_id,
+                        CalendarCal.owner == owner,
+                    ).first()
+                    if not local_cal:
+                        local_cal = CalendarCal(
+                            id=cal_id,
+                            owner=owner,
+                            name=display_name,
+                            color="#5b8abf",
+                            source="caldav",
+                            account_id=account_id or None,
+                            caldav_base_url=remote_url,
+                        )
+                        db.add(local_cal)
+                        db.commit()
+                    else:
+                        # Refresh display name and stamp CalDAV metadata if missing.
+                        changed = False
+                        if local_cal.name != display_name:
+                            local_cal.name = display_name
+                            changed = True
+                        if account_id and not local_cal.account_id:
+                            local_cal.account_id = account_id
+                            changed = True
+                        if local_cal.caldav_base_url != remote_url:
+                            local_cal.caldav_base_url = remote_url
+                            changed = True
+                        if changed:
+                            db.commit()
+                    result["calendars"] += 1
+
+                    # Fetch events in window. `date_search` returns CalendarObject
+                    # resources; each may contain one VEVENT (most servers) or
+                    # several (rare).
+                    from icalendar import Calendar as iCal
+
+                    seen_uids = set()
+                    # Track events added to the session but not yet committed so
+                    # duplicate UIDs within the same batch are updated, not re-inserted
+                    # (which would violate the UNIQUE constraint on commit).
+                    pending: dict = {}
+                    parse_failed = False
                     try:
-                        ical = iCal.from_ical(obj.data)
+                        if access_token and _is_google_host(remote_url):
+                            # OAuth Google: caldav 3.2.x search() lazy-loads each
+                            # object with a per-href GET that Google 404s ("No events
+                            # found."); fetch via a direct REPORT with inline
+                            # calendar-data. Basic-auth Google stays on date_search
+                            # below so its "needs OAuth" diagnostic still fires.
+                            objs = _google_report_events(client, remote_url, start, end)
+                        else:
+                            objs = remote_cal.date_search(start=start, end=end, expand=False)
+                    except NotFoundError as e:
+                        if access_token is None and _is_google_host(url):
+                            result["errors"].append(
+                                f"{display_name}: primary calendar rejected basic-auth CalDAV — "
+                                "this Google Workspace account needs OAuth. Use 'Connect Google Calendar'.")
+                        else:
+                            result["errors"].append(f"{display_name}: date_search failed ({e})")
+                        continue
                     except Exception as e:
-                        result["errors"].append(f"{display_name}: parse failed ({e})")
-                        parse_failed = True
+                        result["errors"].append(f"{display_name}: date_search failed ({e})")
                         continue
 
-                    # Group this object's VEVENTs by uid before writing:
-                    # a recurring series ships its master plus optional
-                    # RECURRENCE-ID override components under ONE uid, and
-                    # processing them independently made whichever walked
-                    # last overwrite the other's row — an override (no
-                    # RRULE) silently collapsed the whole series to a
-                    # single occurrence (#3762). Grouping also makes the
-                    # reconciliation independent of component order.
-                    obj_masters: dict = {}
-                    obj_overrides: dict = {}
-                    for comp in ical.walk():
-                        if comp.name != "VEVENT":
+                    for obj in objs:
+                        try:
+                            ical = iCal.from_ical(obj.data)
+                        except Exception as e:
+                            result["errors"].append(f"{display_name}: parse failed ({e})")
+                            parse_failed = True
                             continue
-                        uid_val = str(comp.get("uid", "")) or str(uuid.uuid4())
-                        if comp.get("recurrence-id") is not None:
-                            obj_overrides.setdefault(uid_val, []).append(comp)
-                        elif uid_val not in obj_masters:
-                            obj_masters[uid_val] = comp
 
-                    def _upsert(row_uid: str, fields: dict):
-                        existing = _find_existing_event(db, pending, row_uid, local_cal.id)
-                        if existing:
-                            # Read-only calendars are remote-authoritative: a
-                            # local edit can never be pushed, so honouring its
-                            # pending flag would strand the divergence forever.
-                            # Overwrite from the server and clear the flag.
-                            if existing.caldav_sync_pending in {"create", "update"} and not read_only:
-                                result["events"] += 1
-                                return
-                            existing.calendar_id = local_cal.id
-                            for key, value in fields.items():
-                                setattr(existing, key, value)
-                            existing.origin = "caldav"
-                            existing.remote_href = str(getattr(obj, "url", "") or "") or None
-                            existing.remote_etag = _event_etag(obj) or None
-                            existing.caldav_sync_pending = None
-                        else:
-                            # Same VEVENT uid already stored under another
-                            # calendar (shared/subscribed calendar, or one
-                            # account that also sees it). uid is the global PK,
-                            # so we cannot insert a second copy; doing so raises
-                            # IntegrityError on commit, which is caught only
-                            # per-calendar and rolls back every event in this
-                            # calendar. Skip the duplicate instead.
-                            if _uid_taken_by_other_calendar(db, row_uid):
-                                result["skipped"] += 1
-                                return
-                            new_ev = CalendarEvent(
-                                uid=row_uid,
-                                calendar_id=local_cal.id,
-                                origin="caldav",
-                                remote_href=str(getattr(obj, "url", "") or "") or None,
-                                remote_etag=_event_etag(obj) or None,
-                                **fields,
-                            )
-                            db.add(new_ev)
-                            pending[row_uid] = new_ev
-                        result["events"] += 1
+                        # Group this object's VEVENTs by uid before writing:
+                        # a recurring series ships its master plus optional
+                        # RECURRENCE-ID override components under ONE uid, and
+                        # processing them independently made whichever walked
+                        # last overwrite the other's row — an override (no
+                        # RRULE) silently collapsed the whole series to a
+                        # single occurrence (#3762). Grouping also makes the
+                        # reconciliation independent of component order.
+                        obj_masters: dict = {}
+                        obj_overrides: dict = {}
+                        for comp in ical.walk():
+                            if comp.name != "VEVENT":
+                                continue
+                            uid_val = str(comp.get("uid", "")) or str(uuid.uuid4())
+                            if comp.get("recurrence-id") is not None:
+                                obj_overrides.setdefault(uid_val, []).append(comp)
+                            elif uid_val not in obj_masters:
+                                obj_masters[uid_val] = comp
 
-                    for uid_val, comp in obj_masters.items():
-                        fields = _event_fields_from_component(comp)
-                        if fields is None:
-                            continue
-                        seen_uids.add(uid_val)
-                        # Persist exclusions next to the RRULE content; the
-                        # expansion side (rrulestr) parses the combined block
-                        # into an exclusion-aware rruleset.
-                        if fields["rrule"]:
-                            ex_lines = _exdate_lines(comp, obj_overrides.get(uid_val, []))
-                            if ex_lines:
-                                fields["rrule"] = "\n".join([fields["rrule"], *ex_lines])
-                        _upsert(uid_val, fields)
+                        def _upsert(row_uid: str, fields: dict):
+                            existing = _find_existing_event(db, pending, row_uid, local_cal.id)
+                            if existing:
+                                # Read-only calendars are remote-authoritative: a
+                                # local edit can never be pushed, so honouring its
+                                # pending flag would strand the divergence forever.
+                                # Overwrite from the server and clear the flag.
+                                if existing.caldav_sync_pending in {"create", "update"} and not read_only:
+                                    result["events"] += 1
+                                    return
+                                existing.calendar_id = local_cal.id
+                                for key, value in fields.items():
+                                    setattr(existing, key, value)
+                                existing.origin = "caldav"
+                                existing.remote_href = str(getattr(obj, "url", "") or "") or None
+                                existing.remote_etag = _event_etag(obj) or None
+                                existing.caldav_sync_pending = None
+                            else:
+                                # Same VEVENT uid already stored under another
+                                # calendar (shared/subscribed calendar, or one
+                                # account that also sees it). uid is the global PK,
+                                # so we cannot insert a second copy; doing so raises
+                                # IntegrityError on commit, which is caught only
+                                # per-calendar and rolls back every event in this
+                                # calendar. Skip the duplicate instead.
+                                if _uid_taken_by_other_calendar(db, row_uid):
+                                    result["skipped"] += 1
+                                    return
+                                new_ev = CalendarEvent(
+                                    uid=row_uid,
+                                    calendar_id=local_cal.id,
+                                    origin="caldav",
+                                    remote_href=str(getattr(obj, "url", "") or "") or None,
+                                    remote_etag=_event_etag(obj) or None,
+                                    **fields,
+                                )
+                                db.add(new_ev)
+                                pending[row_uid] = new_ev
+                            result["events"] += 1
 
-                    for uid_val, comps in obj_overrides.items():
-                        for comp in comps:
+                        for uid_val, comp in obj_masters.items():
                             fields = _event_fields_from_component(comp)
                             if fields is None:
                                 continue
-                            # An override is a standalone occurrence, never a
-                            # series of its own.
-                            fields["rrule"] = ""
-                            row_uid = _override_uid(uid_val, comp)
-                            seen_uids.add(row_uid)
-                            # The base uid must survive the prune even when the
-                            # master sits outside the sync window.
                             seen_uids.add(uid_val)
-                            _upsert(row_uid, fields)
-                db.commit()
+                            # Persist exclusions next to the RRULE content; the
+                            # expansion side (rrulestr) parses the combined block
+                            # into an exclusion-aware rruleset.
+                            if fields["rrule"]:
+                                ex_lines = _exdate_lines(comp, obj_overrides.get(uid_val, []))
+                                if ex_lines:
+                                    fields["rrule"] = "\n".join([fields["rrule"], *ex_lines])
+                            _upsert(uid_val, fields)
 
-                # Prune locally-cached CalDAV events that vanished
-                # upstream (only within our sync window — events outside
-                # the window aren't in `objs`, so we'd false-delete them).
-                # Only rows we previously pulled from the server (origin=="caldav")
-                # are prunable; locally-created events (agent / email triage / a
-                # UI event whose write-back failed) carry origin NULL and must
-                # never be deleted just because the server didn't return them.
-                # Skip the prune on any parse failure: seen_uids is then an
-                # incomplete view of the server, so pruning against it would
-                # delete events that still exist upstream but could not be read
-                # (the empty-seen_uids case wipes the whole window; a partial
-                # failure deletes just the unreadable rows).
-                if _should_prune_window(seen_uids, parse_failed):
-                    stale = db.query(CalendarEvent).filter(
-                        CalendarEvent.calendar_id == local_cal.id,
-                        CalendarEvent.origin == "caldav",
-                        CalendarEvent.dtstart >= start,
-                        CalendarEvent.dtstart <= end,
-                        CalendarEvent.remote_href.isnot(None),
-                        # Read-only: prune diverged local rows too (incl. ones
-                        # an edit moved out of the window) — server wins.
-                        *([] if read_only else [CalendarEvent.caldav_sync_pending.is_(None)]),
-                        ~CalendarEvent.uid.in_(seen_uids) if seen_uids else CalendarEvent.uid.isnot(None),
-                    ).all()
-                    for ev in stale:
-                        db.delete(ev)
-                    result["deleted"] += len(stale)
+                        for uid_val, comps in obj_overrides.items():
+                            for comp in comps:
+                                fields = _event_fields_from_component(comp)
+                                if fields is None:
+                                    continue
+                                # An override is a standalone occurrence, never a
+                                # series of its own.
+                                fields["rrule"] = ""
+                                row_uid = _override_uid(uid_val, comp)
+                                seen_uids.add(row_uid)
+                                # The base uid must survive the prune even when the
+                                # master sits outside the sync window.
+                                seen_uids.add(uid_val)
+                                _upsert(row_uid, fields)
                     db.commit()
-            except Exception as e:
-                logger.exception("CalDAV sync failed for one calendar")
-                result["errors"].append(str(e)[:200])
-                db.rollback()
-    finally:
-        db.close()
 
-    return result
+                    # Prune locally-cached CalDAV events that vanished
+                    # upstream (only within our sync window — events outside
+                    # the window aren't in `objs`, so we'd false-delete them).
+                    # Only rows we previously pulled from the server (origin=="caldav")
+                    # are prunable; locally-created events (agent / email triage / a
+                    # UI event whose write-back failed) carry origin NULL and must
+                    # never be deleted just because the server didn't return them.
+                    # Skip the prune on any parse failure: seen_uids is then an
+                    # incomplete view of the server, so pruning against it would
+                    # delete events that still exist upstream but could not be read
+                    # (the empty-seen_uids case wipes the whole window; a partial
+                    # failure deletes just the unreadable rows).
+                    if _should_prune_window(seen_uids, parse_failed):
+                        stale = db.query(CalendarEvent).filter(
+                            CalendarEvent.calendar_id == local_cal.id,
+                            CalendarEvent.origin == "caldav",
+                            CalendarEvent.dtstart >= start,
+                            CalendarEvent.dtstart <= end,
+                            CalendarEvent.remote_href.isnot(None),
+                            # Read-only: prune diverged local rows too (incl. ones
+                            # an edit moved out of the window) — server wins.
+                            *([] if read_only else [CalendarEvent.caldav_sync_pending.is_(None)]),
+                            ~CalendarEvent.uid.in_(seen_uids) if seen_uids else CalendarEvent.uid.isnot(None),
+                        ).all()
+                        for ev in stale:
+                            db.delete(ev)
+                        result["deleted"] += len(stale)
+                        db.commit()
+                except Exception as e:
+                    logger.exception("CalDAV sync failed for one calendar")
+                    result["errors"].append(str(e)[:200])
+                    db.rollback()
+        finally:
+            db.close()             # NOT client.close() here anymore
+
+        return result
+    finally:
+        client.close()             # always called
 
 
 def _event_payload(ev) -> dict:

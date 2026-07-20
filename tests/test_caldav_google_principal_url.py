@@ -110,6 +110,9 @@ class _FakeClient:
             )
             return types.SimpleNamespace(status=207, raw=xml)
         return types.SimpleNamespace(status=404, raw="No events found.")
+    def close(self):
+        # Mirror the real DAVClient: sync now closes the client on every path.
+        self.closed = True
 
 
 def _install_fake_caldav(monkeypatch):

@@ -214,6 +214,9 @@ def _install_fake_caldav_raising(monkeypatch, exc_factory):
         def calendar(self, url=None):
             return _Cal(url)
 
+        def close(self):
+            self.closed = True
+
     fake.DAVClient = _Client
     fake.lib = lib_mod
     lib_mod.error = err_mod

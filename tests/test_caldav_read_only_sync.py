@@ -90,6 +90,9 @@ class _FakeClient:
     def calendar(self, url=None):
         return _FakeCalendar(url)
 
+    def close(self):
+        self.closed = True
+
 
 def _install(monkeypatch):
     fake = types.ModuleType("caldav")

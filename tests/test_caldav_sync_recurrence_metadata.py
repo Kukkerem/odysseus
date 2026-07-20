@@ -94,6 +94,9 @@ class _FakeClient:
     def principal(self):
         return _FakePrincipal(self._cals)
 
+    def close(self):
+        self.closed = True
+
 
 def _patch_client(monkeypatch, fake):
     # The fork's _build_dav_client takes a 4th access_token argument
