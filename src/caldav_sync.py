@@ -164,6 +164,27 @@ def _to_utc_naive(dt):
     return datetime(dt.year, dt.month, dt.day), True
 
 
+def _extract_tzid(dtstart_prop):
+    """IANA zone name of a DTSTART property when it carried a TZID.
+
+    icalendar resolves the TZID (and any embedded VTIMEZONE) to a ZoneInfo,
+    so the resolved ``.key`` is the reliable IANA name; fall back to the raw
+    TZID parameter. Returns None for naive/floating or date-only values so
+    those rows keep the legacy naive-UTC expansion.
+    """
+    dt = getattr(dtstart_prop, "dt", None)
+    if not isinstance(dt, datetime) or dt.tzinfo is None:
+        return None
+    key = getattr(dt.tzinfo, "key", None) or getattr(dt.tzinfo, "zone", None)
+    if key:
+        return str(key)
+    try:
+        tzid = dtstart_prop.params.get("TZID")
+    except Exception:
+        tzid = None
+    return str(tzid) if tzid else None
+
+
 def _event_fields_from_component(comp):
     """Extract the CalendarEvent column values from one VEVENT component.
 
@@ -202,6 +223,7 @@ def _event_fields_from_component(comp):
         "dtend": end_dt,
         "all_day": all_day,
         "is_utc": row_is_utc,
+        "tzid": _extract_tzid(dtstart_p),
         "summary": str(comp.get("summary", "")),
         "description": str(comp.get("description", "")),
         "location": str(comp.get("location", "")),

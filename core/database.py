@@ -1765,6 +1765,11 @@ class CalendarEvent(TimestampMixin, Base):
     # that preserve the source TZID). False = legacy naive-local. Drives the
     # `Z`-suffix on serialization so the frontend interprets correctly.
     is_utc      = Column(Boolean, default=False, nullable=False)
+    # IANA timezone (e.g. "Europe/Budapest") of the source DTSTART when it
+    # carried a TZID. Lets recurrence expansion repeat wall-clock local time
+    # so occurrences stay correct across DST transitions. NULL = floating /
+    # legacy rows, which expand in the stored (naive-UTC) frame as before.
+    tzid        = Column(String, nullable=True)
     rrule       = Column(String, default="")
     recurrence_exdates = Column(Text, default="")  # JSON list of skipped occurrence starts
     color       = Column(String, nullable=True)  # per-event color override
@@ -1963,6 +1968,7 @@ def init_db():
     _migrate_seed_email_account()
     _migrate_add_calendar_metadata()
     _migrate_add_calendar_is_utc()
+    _migrate_add_calendar_tzid()
     _migrate_add_calendar_origin()
     _migrate_add_calendar_account_id()
     _migrate_add_caldav_sync_columns()
@@ -2257,6 +2263,33 @@ def _migrate_add_calendar_is_utc():
             logging.getLogger(__name__).info("Migrated: added 'is_utc' column to calendar_events")
     except Exception as e:
         logging.getLogger(__name__).warning(f"is_utc migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _migrate_add_calendar_tzid():
+    """Add `tzid` to calendar_events so recurrence expansion can repeat an
+    event's wall-clock local time and stay DST-correct. Populated by the
+    CalDAV sync on the next pull; NULL rows keep the legacy naive-UTC
+    expansion. Idempotent."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(calendar_events)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns and "tzid" not in columns:
+            conn.execute("ALTER TABLE calendar_events ADD COLUMN tzid VARCHAR")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added 'tzid' column to calendar_events")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"tzid migration failed: {e}")
     finally:
         try:
             conn.close()

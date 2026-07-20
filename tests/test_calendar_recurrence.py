@@ -56,6 +56,7 @@ def _make_event(**overrides):
         "dtend": datetime(2026, 6, 1, 10, 0),
         "all_day": False,
         "is_utc": False,
+        "tzid": None,
         "rrule": "",
         "recurrence_exdates": "",
         "calendar": _MOCK_CAL.name,
@@ -354,3 +355,71 @@ def test_expand_daily_rrule_large_window_is_capped_and_marked_truncated():
     assert len(results) == cal._RRULE_EXPANSION_LIMIT
     assert results[-1]["uid"] == "evt-daily-cap::2022-09-26T09:00"
     assert all(r["truncated"] is True for r in results)
+
+
+# ── DST-correct recurrence (tzid) ────────────────────────
+
+def _sap_event():
+    """SAP-Daily reproduction: a weekly meeting whose series master is anchored
+    in WINTER (2 Dec 2024, Europe/Budapest = UTC+1). Stored dtstart is the UTC
+    instant (09:30Z == 10:30 local)."""
+    return _make_event(
+        uid="sap-daily",
+        summary="SAP - Daily",
+        dtstart=datetime(2024, 12, 2, 9, 30),   # naive UTC (10:30 CET)
+        dtend=datetime(2024, 12, 2, 9, 40),
+        is_utc=True,
+        tzid="Europe/Budapest",
+        rrule="FREQ=WEEKLY;BYDAY=MO,TU,WE,TH;WKST=MO",
+    )
+
+
+def test_expand_tzid_summer_keeps_wall_clock_dst():
+    """Winter-anchored series viewed in SUMMER must keep 10:30 wall-clock, i.e.
+    08:30Z (CEST, UTC+2) — NOT the buggy 09:30Z that a UTC-frame expansion
+    produces. This is the SAP - Daily regression."""
+    cal = import_calendar_routes()
+    ev = _sap_event()
+    results = cal._expand_rrule(ev, datetime(2026, 7, 6), datetime(2026, 7, 10))
+    assert results, "expected weekday occurrences in the window"
+    for r in results:
+        assert r["dtstart"].endswith("T08:30:00Z"), r["dtstart"]
+    # Mon-Thu of that week.
+    days = sorted(r["dtstart"][:10] for r in results)
+    assert days == ["2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09"], days
+
+
+def test_expand_tzid_winter_keeps_wall_clock_std():
+    """Same series viewed in WINTER keeps 10:30 wall-clock == 09:30Z (CET,
+    UTC+1). Confirms the anchor offset is applied per-occurrence, not frozen."""
+    cal = import_calendar_routes()
+    ev = _sap_event()
+    results = cal._expand_rrule(ev, datetime(2026, 1, 5), datetime(2026, 1, 9))
+    assert results
+    for r in results:
+        assert r["dtstart"].endswith("T09:30:00Z"), r["dtstart"]
+
+
+def test_expand_tzid_exdate_excludes_in_local_frame():
+    """An EXDATE stored as a bare UTC stamp (as the CalDAV sync writes it) still
+    excludes the right occurrence once expansion is tz-aware."""
+    cal = import_calendar_routes()
+    ev = _sap_event()
+    # Exclude Mon 6 Jul 2026 (10:30 CEST == 08:30Z).
+    ev.rrule = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH;WKST=MO\nEXDATE:20260706T083000"
+    results = cal._expand_rrule(ev, datetime(2026, 7, 6), datetime(2026, 7, 10))
+    days = sorted(r["dtstart"][:10] for r in results)
+    assert "2026-07-06" not in days, days
+    assert days == ["2026-07-07", "2026-07-08", "2026-07-09"], days
+
+
+def test_expand_no_tzid_legacy_naive_unchanged():
+    """Rows without a tzid keep the legacy naive-UTC expansion (occurrence stays
+    at the stored instant, 09:30Z all year) — guards backward compatibility."""
+    cal = import_calendar_routes()
+    ev = _sap_event()
+    ev.tzid = None
+    results = cal._expand_rrule(ev, datetime(2026, 7, 6), datetime(2026, 7, 10))
+    assert results
+    for r in results:
+        assert r["dtstart"].endswith("T09:30:00Z"), r["dtstart"]
