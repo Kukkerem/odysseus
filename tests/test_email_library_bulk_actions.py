@@ -31,6 +31,10 @@ def test_bulk_flag_actions_use_single_bulk_flag_request():
     assert "JSON.stringify" in src
     # done sets both flags; read/unread toggle \Seen via add/remove
     assert "Answered" in src and "Seen" in src
+    # #800 regression guard: read/unread must optimistically sync the cached
+    # read state (not merely set em.is_read), so a later provider refresh
+    # cannot resurface the pre-bulk state.
+    assert "_syncEmailReadState(uid, action === 'read')" in src
 
 
 def test_bulk_flag_checks_backend_success_before_syncing_cache():
