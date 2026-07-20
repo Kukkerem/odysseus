@@ -26,8 +26,6 @@ from src.tool_security import (
     email_tool_policy_names,
     is_public_blocked_tool,
     owner_is_admin_or_single_user,
-    is_high_risk_tool,
-    highrisk_confirm_enabled,
 )
 from src.tool_policy import ToolPolicy
 from src.constants import MAX_OUTPUT_CHARS, MAX_READ_CHARS, MAX_DIFF_LINES, DATA_DIR
@@ -737,28 +735,6 @@ async def _execute_tool_block_impl(
         }
         logger.warning("Public tool policy blocked owner=%r tool=%s", owner, tool)
         return desc, result
-
-    # Optional high-risk confirmation gate. Off by default (upstream behavior
-    # unchanged); enable per-deployment with AGENT_HIGHRISK_REQUIRE_CONFIRM=1.
-    # When on, tools that execute code, write files, send mail, read secrets, or
-    # change privileged config do NOT auto-execute inside the agent loop — this
-    # severs the prompt-injection -> autonomous exfil/RCE chain. The ack must
-    # come from outside the model (a human), so an in-band marker the model
-    # could emit itself is intentionally NOT honored.
-    if highrisk_confirm_enabled() and is_high_risk_tool(tool):
-        desc = f"{tool}: CONFIRMATION REQUIRED"
-        result = {
-            "error": (
-                f"Tool '{tool}' is high-risk and this deployment requires explicit "
-                "human confirmation before it runs. It was NOT executed. Tell the "
-                "user what you intend to do and ask them to run or approve it."
-            ),
-            "exit_code": 1,
-            "needs_confirmation": True,
-        }
-        logger.warning("High-risk tool gated (confirm required) owner=%r tool=%s", owner, tool)
-        return desc, result
-
 
     # Background execution: a `bash` block whose first line is the `#!bg`
     # marker runs DETACHED — returns a job id immediately so the chat stream

@@ -166,49 +166,6 @@ _PLAN_MODE_KNOWN_MUTATORS = {
 }
 
 
-# Tools that execute code, write files, send outbound messages, read secret
-# material, or change privileged/persistent config. Under the high-risk gate
-# (AGENT_HIGHRISK_REQUIRE_CONFIRM) these do NOT auto-execute in the agent loop,
-# severing the prompt-injection -> autonomous exfil/RCE chain. Deliberately a
-# tight set: benign mutations (manage_notes/tasks/memory/calendar, email
-# archive/mark-read, document edits) stay autonomous so research/triage
-# automation keeps working; only exfil/RCE/secret/credential surfaces are gated.
-HIGH_RISK_TOOLS = {
-    # arbitrary code execution
-    "bash", "python",
-    # filesystem writes
-    "write_file", "edit_file",
-    # outbound messaging (primary exfiltration channel)
-    "send_email", "reply_to_email", "bulk_email",
-    # raw internal/loopback API surface
-    "api_call", "app_api",
-    # secret material
-    "vault_get", "vault_unlock", "vault_search",
-    # privileged/persistent config and credential minting
-    "manage_settings", "manage_tokens", "manage_webhooks",
-    "manage_mcp", "manage_skills", "manage_endpoints",
-}
-
-
-def is_high_risk_tool(tool_name: Optional[str]) -> bool:
-    """Whether a tool needs confirmation under the high-risk gate. Fails CLOSED:
-    a non-string name is treated as high-risk; empty/None is not a tool."""
-    if tool_name is None or tool_name == "":
-        return False
-    if not isinstance(tool_name, str):
-        return True
-    return tool_name in HIGH_RISK_TOOLS
-
-
-def highrisk_confirm_enabled() -> bool:
-    """True when this deployment requires human confirmation for high-risk
-    tools (AGENT_HIGHRISK_REQUIRE_CONFIRM). Off by default — upstream behavior."""
-    import os
-    return os.environ.get("AGENT_HIGHRISK_REQUIRE_CONFIRM", "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
-
-
 def plan_mode_disabled_tools() -> Set[str]:
     """Tool names to add to the denylist in plan mode.
 
