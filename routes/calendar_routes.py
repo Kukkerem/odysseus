@@ -4,7 +4,7 @@ import logging
 import json
 import re
 import uuid
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query
@@ -597,6 +597,35 @@ def _occurrence_exdate_key(uid: str, ev: CalendarEvent) -> str:
     return suffix[:16]
 
 
+def _resolve_event_tz(ev):
+    """ZoneInfo for a recurring event's source timezone, or None.
+
+    Only timed events imported with a real TZID (``tzid`` set + ``is_utc``)
+    expand in a zone; all-day, floating, and legacy rows keep the naive-UTC
+    frame. An unknown/unresolvable tzid also falls back to None (no worse than
+    the legacy behavior).
+    """
+    tzid = getattr(ev, "tzid", None)
+    if not tzid or getattr(ev, "all_day", False) or not getattr(ev, "is_utc", False):
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(str(tzid))
+    except Exception:
+        return None
+
+
+def _utcify_rrule_bounds(rrule_str):
+    """Mark bare UNTIL/EXDATE datetime stamps as UTC (append Z).
+
+    Stored bounds are UTC instants written without a zone (EXDATE from the
+    sync) or already carry Z (UNTIL from exporters). dateutil requires them
+    tz-aware when DTSTART is tz-aware, so add Z to any YYYYMMDDThhmmss lacking
+    one. Bare date stamps (all-day) never reach this path.
+    """
+    return re.sub(r"(\d{8}T\d{6})(?!Z)", r"\1Z", rrule_str)
+
+
 def _expand_rrule(
     ev: CalendarEvent, start: datetime, end: datetime
 ) -> List[dict]:
@@ -622,22 +651,33 @@ def _expand_rrule(
         d["truncated"] = False
         return [d]
 
-    # Parse the rrule, applying it to the base dtstart.
+    # Parse the rrule, applying it to the base dtstart. RFC 5545 recurrence
+    # repeats wall-clock LOCAL time, so when the source carried a timezone we
+    # anchor + expand in that zone and convert each occurrence back to UTC.
+    # Otherwise a series anchored in one DST period drifts by the offset delta
+    # once viewed in another (a winter-anchored 10:30 meeting rendering 11:30 in
+    # summer). Rows without a tzid keep the legacy naive-UTC expansion.
     rrule_str = ev.rrule
-    if ev.dtstart is not None and getattr(ev.dtstart, "tzinfo", None) is None:
-        # Events are stored with a naive (UTC) dtstart, but standard .ics
-        # exporters (Google/Apple/Outlook/Fastmail) write the bound as an
-        # absolute UTC value, e.g. UNTIL=20240105T090000Z. dateutil refuses to
-        # mix a tz-aware UNTIL with a naive DTSTART ("RRULE UNTIL values must be
-        # specified in UTC when DTSTART is timezone-aware"), so the except branch
-        # below would silently collapse the whole series to a single event.
-        # Drop the trailing Z so UNTIL matches the naive DTSTART.
-        import re as _re
-        rrule_str = _re.sub(
-            r"(UNTIL=\d{8}(?:T\d{6})?)Z", r"\1", rrule_str, flags=_re.IGNORECASE
-        )
+    tz = _resolve_event_tz(ev)
+    if tz is not None:
+        # tz-aware DTSTART: dateutil requires UNTIL/EXDATE tz-aware too. Our
+        # stored bounds are UTC instants, so mark bare stamps as UTC.
+        rrule_str = _utcify_rrule_bounds(rrule_str)
+        anchor = ev.dtstart.replace(tzinfo=timezone.utc).astimezone(tz)
+    else:
+        anchor = ev.dtstart
+        if anchor is not None and getattr(anchor, "tzinfo", None) is None:
+            # Naive (UTC) dtstart, but standard .ics exporters
+            # (Google/Apple/Outlook/Fastmail) write UNTIL as an absolute UTC
+            # value, e.g. UNTIL=20240105T090000Z. dateutil refuses to mix a
+            # tz-aware UNTIL with a naive DTSTART, so the except branch below
+            # would silently collapse the whole series to a single event. Drop
+            # the trailing Z so UNTIL matches the naive DTSTART.
+            rrule_str = re.sub(
+                r"(UNTIL=\d{8}(?:T\d{6})?)Z", r"\1", rrule_str, flags=re.IGNORECASE
+            )
     try:
-        rule = rrulestr(rrule_str, dtstart=ev.dtstart)
+        rule = rrulestr(rrule_str, dtstart=anchor)
     except Exception as ex:
         logger.warning(
             "Failed to parse rrule=%r for event %s: %s", ev.rrule, ev.uid, ex
@@ -658,12 +698,20 @@ def _expand_rrule(
     # (matching non-recurring overlap semantics: dtstart < end AND
     # dtend > start).
     expand_start = start - duration
+    if tz is not None:
+        expand_start = expand_start.replace(tzinfo=timezone.utc)
     results = []
     truncated = False
     base = _event_to_dict(ev)
     exdates = set(_recurrence_exdates(ev))
 
-    for occ_start in rule.xafter(expand_start, inc=True):
+    for occ_raw in rule.xafter(expand_start, inc=True):
+        # Normalize back to the naive-UTC frame the rest of the loop (overlap
+        # filter, exdate keys, Z-suffixed serialization) already speaks.
+        occ_start = (
+            occ_raw.astimezone(timezone.utc).replace(tzinfo=None)
+            if tz is not None else occ_raw
+        )
         if occ_start >= end:
             break
 
