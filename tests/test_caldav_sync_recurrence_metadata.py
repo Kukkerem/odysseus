@@ -95,6 +95,9 @@ class _FakeClient:
         return _FakePrincipal(self._cals)
 
 
+    def close(self):
+        pass
+
 def _patch_client(monkeypatch, fake):
     # The fork's _build_dav_client takes a 4th access_token argument
     # (OAuth path); accept and ignore it so the fake stands in cleanly.

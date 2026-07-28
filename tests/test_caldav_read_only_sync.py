@@ -87,6 +87,10 @@ class _FakeClient:
     def principal(self):
         return _FakePrincipal()
 
+    def close(self):
+        # _sync_blocking closes the client in its finally block.
+        pass
+
     def calendar(self, url=None):
         return _FakeCalendar(url)
 

@@ -211,6 +211,10 @@ def _install_fake_caldav_raising(monkeypatch, exc_factory):
         def principal(self):
             return _Principal()
 
+        def close(self):
+            # _sync_blocking closes the client in its finally block.
+            pass
+
         def calendar(self, url=None):
             return _Cal(url)
 

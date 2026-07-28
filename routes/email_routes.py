@@ -1744,6 +1744,7 @@ def setup_email_routes():
         "read_cache_get": _read_cache_get,
         "read_cache_put": _read_cache_put,
         "read_cache_key": _read_cache_key,
+        "max_per_key": _IMAP_POOL_MAX_PER_KEY,
     }
     # Wire the module-level _imap() context manager into the pool so every
     # `with _imap(account_id, owner=owner) as conn:` reuses an existing connection

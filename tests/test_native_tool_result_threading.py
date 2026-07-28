@@ -34,6 +34,14 @@ def test_append_threads_result_to_correct_tool_call_id():
     tool_msgs = [m for m in messages if m.get("role") == "tool"]
     assert len(tool_msgs) == 1
     assert tool_msgs[0]["tool_call_id"] == "B"
-    assert tool_msgs[0]["content"] == "RESULT"
+    # FORK DIVERGENCE (0c62efd8): this fork fences native tool-call results as
+    # untrusted data, so the payload arrives wrapped rather than raw. Upstream
+    # deliberately leaves the native path unwrapped (see
+    # test_tool_output_prompt_injection.test_native_tool_results_use_tool_role),
+    # so expect this assertion to conflict on the next upstream sync — that is
+    # the signal to re-decide, not to silently unwrap. The subject of THIS test
+    # is the tool_call_id threading asserted above/below, not the payload shape.
+    assert "RESULT" in tool_msgs[0]["content"]
+    assert "UNTRUSTED SOURCE DATA" in tool_msgs[0]["content"]
     asst = next(m for m in messages if m.get("role") == "assistant")
     assert [tc["id"] for tc in asst["tool_calls"]] == ["B"]

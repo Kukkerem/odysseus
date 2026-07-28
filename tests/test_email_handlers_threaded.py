@@ -16,7 +16,6 @@ MUTATION_ROUTES = [
     ("/api/email/delete-permanent/{uid}", "DELETE"),
     ("/api/email/odysseus/reminders", "DELETE"),
     ("/api/email/move/{uid}", "POST"),
-    ("/api/email/folders", "GET"),
     ("/api/email/mark-answered/{uid}", "POST"),
     ("/api/email/clear-answered/{uid}", "POST"),
 ]
@@ -36,6 +35,22 @@ def test_mutation_handlers_run_off_the_event_loop():
         assert not inspect.iscoroutinefunction(ep), (
             f"{method} {path} must be sync def (threadpool), not async-blocking"
         )
+
+
+def test_list_folders_offloads_instead_of_blocking():
+    """`/api/email/folders` is the one handler that stays `async def`.
+
+    It keeps the event loop free a different way: the blocking IMAP LIST runs in
+    `asyncio.to_thread` under a `wait_for` timeout, which also bounds a hung
+    server — something a plain sync (threadpool) handler cannot express. So the
+    no-blocking contract still holds; only the mechanism differs.
+    """
+    router = email_routes.setup_email_routes()
+    ep = _endpoint(router, "/api/email/folders", "GET")
+    assert inspect.iscoroutinefunction(ep)
+    src = inspect.getsource(ep)
+    assert "to_thread(_list_folders_sync)" in src, "must offload the blocking LIST"
+    assert "wait_for" in src, "must bound the offloaded call with a timeout"
 
 
 class _StoreConn:

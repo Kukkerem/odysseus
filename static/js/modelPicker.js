@@ -320,7 +320,9 @@ function _initModelPickerDropdown() {
         //   endpoint's copy only when no live endpoint serves that id.
         // `seenKey` mirrors _pickerModelKey()'s shape so Favorites/Recent, which
         // resolve through it, can address a specific endpoint's copy.
-        const seenKey = `${item.endpoint_id || item.url || item.endpoint_name || (isApiEndpoint ? 'api' : 'local')}::${mid}`;
+        const seenKey = isApiEndpoint
+          ? `${item.endpoint_id || item.url || item.endpoint_name || 'api'}::${mid}`
+          : `${item.endpoint_id || item.url || item.endpoint_name || 'local'}::${mid}`;
         if (isApiEndpoint) {
           if (apiSeen.has(seenKey)) return;
           apiSeen.add(seenKey);
