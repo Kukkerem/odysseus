@@ -664,7 +664,10 @@ def _raw_openai_tool_call_to_block(value) -> Optional[ToolBlock]:
     elif tool_type in ("grep", "glob", "ls", "edit_file"):
         content = json.dumps(args) if args else "{}"
     elif tool_type == "write_file":
-        content = args.get("path", "") + "\n" + args.get("content", "")
+        # Keep raw OpenAI JSON on the canonical path so explicit empty content
+        # remains distinguishable from a missing body.
+        from src.tool_schemas import function_call_to_tool_block
+        return function_call_to_tool_block(name, json.dumps(args))
     elif tool_type == "create_document":
         parts = [args.get("title", "Untitled")]
         if args.get("language"):

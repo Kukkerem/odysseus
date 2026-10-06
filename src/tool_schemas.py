@@ -1442,7 +1442,13 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
     elif tool_type == "get_workspace":
         content = ""
     elif tool_type == "write_file":
-        content = args.get("path", "") + "\n" + args.get("content", "")
+        body = args.get("content")
+        if isinstance(body, str) and body.strip():
+            content = args.get("path", "") + "\n" + body
+        else:
+            # Preserve missing/empty intent for WriteFileTool instead of folding
+            # all empty shapes into the same path-plus-newline representation.
+            content = json.dumps(args)
     elif tool_type == "edit_file":
         content = json.dumps(args)
     elif tool_type == "apply_patch":

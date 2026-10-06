@@ -609,7 +609,9 @@ Read a file and return its contents.""",
 <file path>
 <file contents>
 ```
-Write content to a file. First line is the path, rest is the content.""",
+Write content to a file. First line is the path, rest is the content. An empty body is
+refused when the target already holds data — to clear a file on purpose, send
+`{"path": "<file path>", "content": ""}` instead.""",
 
     "edit_file": """\
 ```edit_file
