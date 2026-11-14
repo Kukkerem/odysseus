@@ -2043,6 +2043,7 @@ def test_text_only_tool_router_keeps_browser_result_text_without_inline_image():
 
 def test_new_browser_snapshot_retires_prior_dom_and_same_batch_states():
     from src.agent_loop import _append_tool_results
+    from src.prompt_security import wrap_tool_result
 
     messages = [{
         "role": "tool",
@@ -2066,7 +2067,8 @@ def test_new_browser_snapshot_retires_prior_dom_and_same_batch_states():
 
     assert messages[0]["content"].startswith("[Prior private-browser DOM state retired")
     assert "superseded by the newest page snapshot" in messages[2]["content"]
-    assert messages[3]["content"] == "newest DOM with refs"
+    # Fork: native tool results are fenced as untrusted data (wrap_tool_result).
+    assert messages[3]["content"] == wrap_tool_result("newest DOM with refs")
 
 
 def test_visual_evidence_window_is_bounded_with_explicit_override(monkeypatch):
