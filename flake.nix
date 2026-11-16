@@ -40,13 +40,17 @@
             # pydantic-core, cryptography, lxml, … — dlopen native shared
             # objects that are not on NixOS's default loader path. Expose the
             # manylinux baseline plus libstdc++/zlib so those wheels load.
+            # glibc stays off the path: the Nix python already loads its own,
+            # and a glibc here is picked up by every system binary started from
+            # the shell, whose own ld.so then aborts on the mismatched libc.so.6
+            # whenever this lock's nixpkgs differs from the host's.
             env = lib.optionalAttrs pkgs.stdenv.isLinux {
               LD_LIBRARY_PATH = lib.makeLibraryPath (
                 (with pkgs; [
                   stdenv.cc.cc.lib
                   zlib
                 ])
-                ++ pkgs.pythonManylinuxPackages.manylinux1
+                ++ lib.remove pkgs.glibc pkgs.pythonManylinuxPackages.manylinux1
               );
             };
 
